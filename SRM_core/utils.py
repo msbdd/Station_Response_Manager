@@ -72,7 +72,6 @@ def convert_inventory_to_xml(input_path: str, output_path: str):
 
 def natural_sort_key(s: str):
     return [
-        int(chunk) if chunk.isdigit() else chunk.lower()
+        (0, int(chunk)) if chunk.isdigit() else (1, chunk.lower())
         for chunk in re.split(r"(\d+)", s)
-        if chunk
     ]
