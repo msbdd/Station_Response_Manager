@@ -649,7 +649,17 @@ class ExplorerTab(QWidget):
         top_layout.addStretch()
         top_layout.addWidget(self.new_button)
         layout.addLayout(top_layout)
-
+        # Search
+        search_layout = QHBoxLayout()
+        self.search_bar = QLineEdit()
+        self.search_bar.setPlaceholderText("Filter properties...")
+        self.clear_search_btn = QPushButton("Clear")
+        search_layout.addWidget(self.search_bar)
+        search_layout.addWidget(self.clear_search_btn)
+        layout.addLayout(search_layout)
+        self.search_bar.textChanged.connect(self.filter_tree)
+        self.clear_search_btn.clicked.connect(self.search_bar.clear)
+        # Search_End
         self.tree = QTreeWidget()
         self.tree.setHeaderLabels(["Field", "Value"])
         self.tree.itemChanged.connect(self.handle_tree_edit)
@@ -1046,6 +1056,32 @@ class ExplorerTab(QWidget):
                 response_data=response,
                 explorer_tab=self,
             )
+
+    def filter_tree(self):
+        search_text = self.search_bar.text().lower()
+        # Iterate over all top-level items in the tree
+        for i in range(self.tree.topLevelItemCount()):
+            item = self.tree.topLevelItem(i)
+            match_found = self._recursive_filter(item, search_text)
+            item.setHidden(not match_found)
+
+    def _recursive_filter(self, item, search_text):
+        child_match_found = False
+        for i in range(item.childCount()):
+            child_item = item.child(i)
+            if self._recursive_filter(child_item, search_text):
+                child_match_found = True
+
+        item_text = (item.text(0) + item.text(1)).lower()
+        self_match = search_text in item_text
+
+        should_be_visible = self_match or child_match_found
+        item.setHidden(not should_be_visible)
+
+        if should_be_visible and search_text:
+            item.setExpanded(True)
+
+        return should_be_visible
 
 
 class ResponseTab(QWidget):
