@@ -1,0 +1,4 @@
+git+https://github.com/msbdd/obspy@dev
+PyQt5
+cx_Freeze
+pyyaml
