@@ -1,4 +1,5 @@
 git+https://github.com/msbdd/obspy@dev
 PyQt5
+PyQtWebEngine
 cx_Freeze
 pyyaml
