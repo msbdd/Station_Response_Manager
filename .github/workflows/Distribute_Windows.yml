@@ -42,7 +42,7 @@ jobs:
         python setup.py build
     - name: Rename build output
       run: |
-        Move-Item build\RBF_Download_Helper ("build\Station_Response_Manager_" + $env:VERSION + "_Windows")
+        Move-Item build\Station_Response_Manager ("build\Station_Response_Manager_" + $env:VERSION + "_Windows")
     - name: Create distribution archive
       run: |
         Compress-Archive -Path ("build\Station_Response_Manager_" + $env:VERSION + "_Windows") -DestinationPath ("Station_Response_Manager_" + $env:VERSION + "_Windows.zip")
