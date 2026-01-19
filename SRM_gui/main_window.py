@@ -323,8 +323,10 @@ class ManagerTab(QWidget):
 
         layout = QHBoxLayout(self)
         self.clipboard_item = None
+        splitter = QSplitter(Qt.Horizontal)
         left_widget = QWidget()
         left_layout = QVBoxLayout(left_widget)
+        left_layout.setContentsMargins(0, 0, 0, 0)
         self.all_stations = []
         self.network_colors = {}
         self.file_tree = QTreeWidget()
@@ -352,19 +354,19 @@ class ManagerTab(QWidget):
         btn_layout.addWidget(delete_btn)
 
         left_layout.addLayout(btn_layout)
-        layout.addWidget(left_widget)
-
+        splitter.addWidget(left_widget)
         self.map_view = QWebEngineView()
-        layout.addWidget(self.map_view)
+        splitter.addWidget(self.map_view)
         current_dir = Path(__file__)
         map_template_path = current_dir.parent / "map_template.html"
         with map_template_path.open("r", encoding="utf-8") as f:
             html_template = f.read()
 
         self.map_view.setHtml(html_template)
-
-        layout.setStretch(0, 1)
-        layout.setStretch(1, 2)
+        splitter.setSizes([300, 600])
+        splitter.setStretchFactor(0, 1)
+        splitter.setStretchFactor(1, 2)
+        layout.addWidget(splitter)
 
     def get_color_for_network(self, network_name):
         if network_name not in self.network_colors:
