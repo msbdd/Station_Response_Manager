@@ -62,6 +62,8 @@ import json
 from obspy.clients.nrl import NRL
 from pathlib import Path
 import colorsys
+from SRM_core.nrl_index import NRLIndex
+from SRM_gui.index_progress_dialog import IndexProgressDialog
 
 
 class MplCanvas(FigureCanvas):
@@ -111,6 +113,13 @@ class MainWindow(QMainWindow):
                     "\nExiting.",
                 )
                 sys.exit(1)
+
+        self.nrl_index = NRLIndex(self.nrl_root)
+        if self.nrl_index.needs_rebuild():
+            dialog = IndexProgressDialog(self.nrl_index, self)
+            dialog.exec_()
+        else:
+            self.nrl_index.load_index()
 
         self.setup_menu()
         self.setup_ui()
@@ -402,6 +411,7 @@ class ManagerTab(QWidget):
                     chan_item = QTreeWidgetItem([f"Channel: {chan.code}"])
                     chan_item.setData(0, Qt.UserRole, ("channel", chan))
                     sta_item.addChild(chan_item)
+                    self._add_instrument_detection(chan_item, chan)
 
                 file_item.setExpanded(True)
 
@@ -419,6 +429,88 @@ class ManagerTab(QWidget):
                 )
         js_code = f"addStations({json.dumps(self.all_stations)});"
         self.map_view.page().runJavaScript(js_code)
+
+    def _add_instrument_detection(self, chan_item, channel):
+        if not channel.response:
+            return
+
+        nrl_index = self.main_window.nrl_index
+        result = nrl_index.detect_instrument(channel.response)
+
+        if result.sensor:
+            if result.sensor_ambiguous:
+                n_candidates = len(result.sensor_candidates)
+                mfr = result.sensor.manufacturer
+                model = result.sensor.model
+                family = result.sensor.family_name or f"{mfr} {model}"
+                sensor_text = f"sensor: {family} (+{n_candidates - 1} similar)"
+            else:
+                sensor_text = (
+                    f"sensor: {result.sensor.manufacturer} "
+                    f"{result.sensor.model}"
+                )
+            sensor_item = QTreeWidgetItem([sensor_text])
+            sensor_item.setData(
+                0, Qt.UserRole, ("sensor_info", result)
+            )
+            sensor_item.setForeground(0, QBrush(QColor("#2e7d32")))
+            font = sensor_item.font(0)
+            font.setItalic(True)
+            sensor_item.setFont(0, font)
+            sensor_item.setFlags(
+                sensor_item.flags() & ~Qt.ItemIsSelectable
+            )
+            if result.sensor_ambiguous:
+                tooltip = "Similar sensors (same response):\n"
+                for c in result.sensor_candidates[:10]:
+                    tooltip += f"  • {c.manufacturer} {c.model}"
+                    if c.variant_params:
+                        tooltip += f" ({c.variant_params})"
+                    tooltip += "\n"
+                if len(result.sensor_candidates) > 10:
+                    remaining = len(result.sensor_candidates) - 10
+                    tooltip += f"  ... and {remaining} more"
+                sensor_item.setToolTip(0, tooltip)
+            chan_item.addChild(sensor_item)
+
+        if result.datalogger:
+            if result.datalogger_confidence >= 0.9:
+                dl_text = (
+                    f"digitizer: {result.datalogger.manufacturer} "
+                    f"{result.datalogger.model}"
+                )
+            elif result.datalogger_ambiguous:
+                n_candidates = len(result.datalogger_candidates)
+                family = (result.datalogger.family_name or
+                          f"{result.datalogger.manufacturer}")
+                dl_text = f"digitizer: {family} (+{n_candidates - 1} similar)"
+            else:
+                dl_text = (
+                    f"digitizer: {result.datalogger.manufacturer} "
+                    f"{result.datalogger.model}"
+                )
+            dl_item = QTreeWidgetItem([dl_text])
+            dl_item.setData(0, Qt.UserRole, ("dl_info", result))
+            dl_item.setForeground(0, QBrush(QColor("#1565c0")))
+            font = dl_item.font(0)
+            font.setItalic(True)
+            dl_item.setFont(0, font)
+            dl_item.setFlags(dl_item.flags() & ~Qt.ItemIsSelectable)
+            is_uncertain = (result.datalogger_ambiguous and
+                            result.datalogger_confidence < 0.9)
+            if is_uncertain:
+                tooltip = f"Confidence: {result.datalogger_confidence:.0%}\n"
+                tooltip += "Similar digitizers (same digital chain):\n"
+                for c in result.datalogger_candidates[:10]:
+                    tooltip += f"  • {c.manufacturer} {c.model}"
+                    if c.variant_params:
+                        tooltip += f" ({c.variant_params})"
+                    tooltip += "\n"
+                if len(result.datalogger_candidates) > 10:
+                    remaining = len(result.datalogger_candidates) - 10
+                    tooltip += f"  ... and {remaining} more"
+                dl_item.setToolTip(0, tooltip)
+            chan_item.addChild(dl_item)
 
     def handle_item_double_click(self, item, column):
         print("Double-click on item:", item.text(0))
@@ -1200,6 +1292,86 @@ class ResponseTab(QWidget):
 
     def populate_stage_tree(self, response):
         self.stage_tree.clear()
+        nrl_index = self.main_window.nrl_index
+        detection = nrl_index.detect_instrument(response)
+        if detection.found_any:
+            detect_item = QTreeWidgetItem(
+                self.stage_tree, ["Detected Instrumentation", ""]
+            )
+            detect_item.setForeground(0, QBrush(QColor("#2e7d32")))
+            font = detect_item.font(0)
+            font.setBold(True)
+            detect_item.setFont(0, font)
+            detect_item.setExpanded(True)
+
+            if detection.sensor:
+                if detection.sensor_ambiguous:
+                    n_cand = len(detection.sensor_candidates)
+                    mfr = detection.sensor.manufacturer
+                    model = detection.sensor.model
+                    family = detection.sensor.family_name or f"{mfr} {model}"
+                    sensor_text = f"{family} (+{n_cand - 1} similar)"
+                else:
+                    sensor_text = (
+                        f"{detection.sensor.manufacturer} "
+                        f"{detection.sensor.model}"
+                    )
+                sensor_item = QTreeWidgetItem(
+                    detect_item, ["Sensor", sensor_text]
+                )
+                sensor_item.setForeground(0, QBrush(QColor("#2e7d32")))
+                sensor_item.setForeground(1, QBrush(QColor("#2e7d32")))
+                if detection.sensor_ambiguous:
+                    tooltip = "Similar sensors (same response):\n"
+                    for c in detection.sensor_candidates[:10]:
+                        tooltip += f"  • {c.manufacturer} {c.model}"
+                        if c.variant_params:
+                            tooltip += f" ({c.variant_params})"
+                        tooltip += "\n"
+                    if len(detection.sensor_candidates) > 10:
+                        remaining = len(detection.sensor_candidates) - 10
+                        tooltip += f"  ... and {remaining} more"
+                    sensor_item.setToolTip(0, tooltip)
+                    sensor_item.setToolTip(1, tooltip)
+
+            if detection.datalogger:
+                if detection.datalogger_confidence >= 0.9:
+                    dl_text = (
+                        f"{detection.datalogger.manufacturer} "
+                        f"{detection.datalogger.model}"
+                    )
+                elif detection.datalogger_ambiguous:
+                    n_cand = len(detection.datalogger_candidates)
+                    mfr = detection.datalogger.manufacturer
+                    family = detection.datalogger.family_name or mfr
+                    dl_text = f"{family} (+{n_cand - 1} similar)"
+                else:
+                    dl_text = (
+                        f"{detection.datalogger.manufacturer} "
+                        f"{detection.datalogger.model}"
+                    )
+                dl_item = QTreeWidgetItem(
+                    detect_item, ["Digitizer", dl_text]
+                )
+                dl_item.setForeground(0, QBrush(QColor("#1565c0")))
+                dl_item.setForeground(1, QBrush(QColor("#1565c0")))
+                is_uncertain = (detection.datalogger_ambiguous and
+                                detection.datalogger_confidence < 0.9)
+                if is_uncertain:
+                    conf = detection.datalogger_confidence
+                    tooltip = f"Confidence: {conf:.0%}\n"
+                    tooltip += "Similar digitizers (same digital chain):\n"
+                    for c in detection.datalogger_candidates[:10]:
+                        tooltip += f"  • {c.manufacturer} {c.model}"
+                        if c.variant_params:
+                            tooltip += f" ({c.variant_params})"
+                        tooltip += "\n"
+                    if len(detection.datalogger_candidates) > 10:
+                        remaining = len(detection.datalogger_candidates) - 10
+                        tooltip += f"  ... and {remaining} more"
+                    dl_item.setToolTip(0, tooltip)
+                    dl_item.setToolTip(1, tooltip)
+
         if response.instrument_sensitivity:
             sens = response.instrument_sensitivity
             sens_item = QTreeWidgetItem(
