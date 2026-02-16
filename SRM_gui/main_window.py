@@ -1,4 +1,5 @@
 from PyQt5.QtWidgets import (
+    QApplication,
     QMainWindow,
     QWidget,
     QVBoxLayout,
@@ -24,17 +25,28 @@ from PyQt5.QtWidgets import (
     QAction,
     QDateTimeEdit,
     QTabBar,
+    QGraphicsView,
+    QGraphicsScene,
+    QGraphicsRectItem,
+    QGraphicsSimpleTextItem,
+    QGraphicsLineItem,
+    QToolTip,
 )
 from copy import deepcopy
 from PyQt5.QtWebEngineWidgets import QWebEngineView
-from PyQt5.QtGui import QColor, QFont, QBrush
+from PyQt5.QtGui import QColor, QFont, QBrush, QPen
 from PyQt5.QtCore import Qt, QTimer, QDateTime
 from SRM_core.utils import (
     combine_resp,
     resource_path,
     wrap_text,
     convert_inventory_to_xml,
-    natural_sort_key
+    natural_sort_key,
+    utc_to_ts,
+    ts_to_label,
+    shift_color,
+    BASE_COLORS,
+    is_dark_theme
 )
 import os
 import sys
@@ -64,6 +76,7 @@ from pathlib import Path
 import colorsys
 from SRM_core.nrl_index import NRLIndex
 from SRM_gui.index_progress_dialog import IndexProgressDialog
+from datetime import datetime, timezone as _tz
 
 
 class MplCanvas(FigureCanvas):
@@ -146,6 +159,36 @@ class MainWindow(QMainWindow):
         convert_to_xml = QAction("Convert to XML", self)
         convert_to_xml.triggered.connect(self.convert_to_xml)
         tools_menu.addAction(convert_to_xml)
+        view_menu = menubar.addMenu("View")
+        font_increase = QAction("Increase Font Size", self)
+        font_increase.setShortcut("Ctrl+=")
+        font_increase.triggered.connect(lambda: self._change_font_size(1))
+        view_menu.addAction(font_increase)
+        font_decrease = QAction("Decrease Font Size", self)
+        font_decrease.setShortcut("Ctrl+-")
+        font_decrease.triggered.connect(lambda: self._change_font_size(-1))
+        view_menu.addAction(font_decrease)
+        font_reset = QAction("Reset Font Size", self)
+        font_reset.setShortcut("Ctrl+0")
+        font_reset.triggered.connect(lambda: self._change_font_size(0))
+        view_menu.addAction(font_reset)
+
+    def _change_font_size(self, delta):
+        app = QApplication.instance()
+        font = app.font()
+        if delta == 0:
+            if not hasattr(self, '_default_font_size'):
+                self._default_font_size = font.pointSize()
+            font.setPointSize(self._default_font_size)
+        else:
+            if not hasattr(self, '_default_font_size'):
+                self._default_font_size = font.pointSize()
+            new_size = max(6, font.pointSize() + delta)
+            font.setPointSize(new_size)
+        app.setFont(font)
+        # Redraw the timeline so its text picks up the new size
+        if hasattr(self, 'manager_tab'):
+            self.manager_tab.update_timeline()
 
     def setup_ui(self):
         self.tabs = QTabWidget()
@@ -364,14 +407,21 @@ class ManagerTab(QWidget):
 
         left_layout.addLayout(btn_layout)
         splitter.addWidget(left_widget)
+        self.right_tabs = QTabWidget()
         self.map_view = QWebEngineView()
-        splitter.addWidget(self.map_view)
         current_dir = Path(__file__)
         map_template_path = current_dir.parent / "map_template.html"
         with map_template_path.open("r", encoding="utf-8") as f:
             html_template = f.read()
-
         self.map_view.setHtml(html_template)
+        self.right_tabs.addTab(self.map_view, "Map")
+
+        self.timeline_widget = TimelineWidget()
+        self.right_tabs.addTab(self.timeline_widget, "Timeline")
+        self.right_tabs.currentChanged.connect(
+            self.on_right_tab_changed
+        )
+        splitter.addWidget(self.right_tabs)
         splitter.setSizes([300, 600])
         splitter.setStretchFactor(0, 1)
         splitter.setStretchFactor(1, 2)
@@ -429,6 +479,7 @@ class ManagerTab(QWidget):
                 )
         js_code = f"addStations({json.dumps(self.all_stations)});"
         self.map_view.page().runJavaScript(js_code)
+        self.update_timeline()
 
     def _add_instrument_detection(self, chan_item, channel):
         if not channel.response:
@@ -719,6 +770,16 @@ class ManagerTab(QWidget):
             except Exception as e:
                 print(f"Error focusing on station: {e}")
 
+    def on_right_tab_changed(self, index):
+        widget = self.right_tabs.widget(index)
+        if widget is self.timeline_widget:
+            QTimer.singleShot(50, self.timeline_widget.view.zoom_fit)
+
+    def update_timeline(self):
+        self.timeline_widget.update_timeline(
+            self.main_window.loaded_files
+        )
+
     def refresh(self):
         self.file_tree.clear()
         for filepath, inventory in self.main_window.loaded_files.items():
@@ -920,6 +981,24 @@ class ExplorerTab(QWidget):
                 self, "Error", "Response not found in inventory."
             )
 
+    def add_object_fields(self, parent_item, obj):
+        for field in sorted(dir(obj)):
+            if field.startswith("_") or callable(getattr(obj, field)):
+                continue
+            value = getattr(obj, field)
+            if isinstance(value, UTCDateTime):
+                item = QTreeWidgetItem(
+                    parent_item, [field, str(value)]
+                )
+                item.setFlags(item.flags() | Qt.ItemIsEditable)
+                item.setData(0, Qt.UserRole, (obj, field))
+            elif isinstance(value, (str, float, int)):
+                item = QTreeWidgetItem(
+                    parent_item, [field, str(value)]
+                )
+                item.setFlags(item.flags() | Qt.ItemIsEditable)
+                item.setData(0, Qt.UserRole, (obj, field))
+
     def populate_tree(self, inv):
         self.tree.clear()
         self.current_inventory = inv
@@ -927,61 +1006,20 @@ class ExplorerTab(QWidget):
             for net in inv.networks:
                 net_item = QTreeWidgetItem([f"Network: {net.code}", ""])
                 self.tree.addTopLevelItem(net_item)
-
-                for field in dir(net):
-                    if not field.startswith("_") and not callable(
-                        getattr(net, field)
-                    ):
-                        value = getattr(net, field)
-                        if isinstance(value, (str, float, int)):
-                            item = QTreeWidgetItem(
-                                net_item, [field, str(value)]
-                            )
-                            item.setFlags(item.flags() | Qt.ItemIsEditable)
-                            item.setData(0, Qt.UserRole, (net, field))
+                self.add_object_fields(net_item, net)
 
                 for sta in net.stations:
                     sta_item = QTreeWidgetItem([f"Station: {sta.code}", ""])
                     sta_item.setData(0, Qt.UserRole, ("station", sta))
                     net_item.addChild(sta_item)
-
-                    for field in dir(sta):
-                        if not field.startswith("_") and not callable(
-                            getattr(sta, field)
-                        ):
-                            value = getattr(sta, field)
-                            if isinstance(value, (str, float, int)):
-                                item = QTreeWidgetItem(
-                                    sta_item, [field, str(value)]
-                                )
-                                item.setFlags(item.flags() | Qt.ItemIsEditable)
-                                item.setData(0, Qt.UserRole, (sta, field))
+                    self.add_object_fields(sta_item, sta)
 
                     for chan in sta.channels:
                         chan_item = QTreeWidgetItem(
                             [f"Channel: {chan.code}", ""]
                         )
                         sta_item.addChild(chan_item)
-                        leaf_item = QTreeWidgetItem(
-                            sta_item, [field, str(value)]
-                        )
-                        leaf_item.setFlags(
-                            leaf_item.flags() | Qt.ItemIsEditable
-                        )
-                        leaf_item.setData(0, Qt.UserRole, (chan, field))
-                        for field in dir(chan):
-                            if not field.startswith("_") and not callable(
-                                getattr(chan, field)
-                            ):
-                                value = getattr(chan, field)
-                                if isinstance(value, (str, float, int)):
-                                    item = QTreeWidgetItem(
-                                        chan_item, [field, str(value)]
-                                    )
-                                    item.setFlags(
-                                        item.flags() | Qt.ItemIsEditable
-                                    )
-                                    item.setData(0, Qt.UserRole, (chan, field))
+                        self.add_object_fields(chan_item, chan)
                         resp = chan.response
                         if resp:
                             resp_item = QTreeWidgetItem(["Response", ""])
@@ -1063,7 +1101,7 @@ class ExplorerTab(QWidget):
             QTreeWidgetItem(self.tree, ["Error", str(e)])
         self.tree.itemSelectionChanged.connect(self.on_tree_selection_changed)
         self.current_obj = None
-        self.tree.expandAll()
+        self.tree.collapseAll()
 
     def on_tree_selection_changed(self):
         item = self.tree.currentItem()
@@ -1099,7 +1137,17 @@ class ExplorerTab(QWidget):
 
         old_value = getattr(ref_object, attr, None)
         try:
-            if isinstance(old_value, float):
+            if isinstance(old_value, UTCDateTime):
+                new_value = UTCDateTime(new_value)
+            elif old_value is None and attr in (
+                "start_date", "end_date", "creation_date",
+                "termination_date",
+            ):
+                if new_value.strip():
+                    new_value = UTCDateTime(new_value)
+                else:
+                    None
+            elif isinstance(old_value, float):
                 new_value = float(new_value)
             elif isinstance(old_value, int):
                 new_value = int(new_value)
@@ -2821,3 +2869,510 @@ class ImportFromMiniSEEDDialog(QDialog):
 
     def get_initial_data(self):
         return self.initial_data
+
+
+class _BarItem(QGraphicsRectItem):
+    """A single bar in the timeline with tooltip."""
+
+    def __init__(self, x, y, w, h, color, tooltip, parent=None):
+        super().__init__(x, y, w, h, parent)
+        qc = QColor(color)
+        qc.setAlpha(220)
+        self.setBrush(QBrush(qc))
+        border = QColor("#333333") if is_dark_theme() else QColor("white")
+        self.setPen(QPen(border, 0.5))
+        self.setAcceptHoverEvents(True)
+        self._tip = tooltip
+
+    def hoverEnterEvent(self, event):
+        QToolTip.showText(
+            event.screenPos(), self._tip
+        )
+
+    def hoverLeaveEvent(self, event):
+        QToolTip.hideText()
+
+
+class TimelineView(QGraphicsView):
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setDragMode(QGraphicsView.ScrollHandDrag)
+        self.setTransformationAnchor(
+            QGraphicsView.AnchorUnderMouse
+        )
+        self.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOn)
+        self.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOn)
+        self._zoom = 0
+        self._timeline_widget = None
+
+    def wheelEvent(self, event):
+        if event.modifiers() & Qt.ShiftModifier:
+            super().wheelEvent(event)
+        else:
+            delta = event.angleDelta().y()
+            if delta > 0:
+                factor = 1.15
+                self._zoom += 1
+            else:
+                factor = 1 / 1.15
+                self._zoom -= 1
+            self.scale(factor, factor)
+            self._notify_sync()
+
+    def zoom_in(self):
+        self.scale(1.25, 1.25)
+        self._zoom += 1
+        self._notify_sync()
+
+    def zoom_out(self):
+        self.scale(1 / 1.25, 1 / 1.25)
+        self._zoom -= 1
+        self._notify_sync()
+
+    def zoom_fit(self):
+        if self.scene():
+            self.fitInView(
+                self.scene().sceneRect(),
+                Qt.KeepAspectRatio,
+            )
+            self._zoom = 0
+            self._notify_sync()
+
+    def _notify_sync(self):
+        if self._timeline_widget:
+            self._timeline_widget.sync_axis()
+
+    def scrollContentsBy(self, dx, dy):
+        super().scrollContentsBy(dx, dy)
+        self._notify_sync()
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self._notify_sync()
+
+
+class TimelineWidget(QWidget):
+
+    ROW_H = 22
+    LABEL_W = 140
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(2)
+
+        ctrl = QHBoxLayout()
+        ctrl.setContentsMargins(4, 2, 4, 0)
+        self.btn_zin = QPushButton("+")
+        self.btn_zout = QPushButton("\u2013")  # en-dash
+        self.btn_fit = QPushButton("Fit")
+        for b in (self.btn_zin, self.btn_zout, self.btn_fit):
+            b.setFixedWidth(36)
+            b.setFixedHeight(22)
+            ctrl.addWidget(b)
+        ctrl.addStretch()
+        self.info_label = QLabel("")
+        self.info_label.setStyleSheet(
+            "color: gray; font-size: 11px;"
+        )
+        ctrl.addWidget(self.info_label)
+        layout.addLayout(ctrl)
+
+        # --- graphics view ---
+        self.scene = QGraphicsScene(self)
+        self.view = TimelineView(self)
+        self.view.setScene(self.scene)
+        self.view.setBackgroundBrush(
+            QBrush(self.palette().color(self.palette().Base))
+        )
+        layout.addWidget(self.view)
+
+        # --- fixed time-axis view (always visible at bottom) ---
+        self.axis_scene = QGraphicsScene(self)
+        self.axis_view = QGraphicsView(self)
+        self.axis_view.setScene(self.axis_scene)
+        self.axis_view.setFixedHeight(28)
+        self.axis_view.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.axis_view.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.axis_view.setInteractive(False)
+        self.axis_view.setFrameShape(self.axis_view.NoFrame)
+        self.axis_view.setBackgroundBrush(
+            QBrush(self.palette().color(self.palette().Base))
+        )
+        layout.addWidget(self.axis_view)
+
+        self.view._timeline_widget = self
+
+        self.btn_zin.clicked.connect(self.view.zoom_in)
+        self.btn_zout.clicked.connect(self.view.zoom_out)
+        self.btn_fit.clicked.connect(self.view.zoom_fit)
+
+    def sync_axis(self):
+        if not hasattr(self, '_t_min') or not self.view.scene():
+            return
+
+        vp = self.view.viewport().rect()
+        visible = self.view.mapToScene(vp).boundingRect()
+
+        lw = self.LABEL_W
+        pps = self._pps
+        t_min = self._t_min
+
+        # Convert visible scene-x range to time range
+        vis_t_start = t_min + max(0, visible.x() - lw) / pps
+        vis_t_end = t_min + max(0, visible.right() - lw) / pps
+        vis_span = max(vis_t_end - vis_t_start, 1)
+
+        # Pick a nice tick interval for the visible range
+        nice_intervals = [
+            3600,             # 1 hour
+            6 * 3600,         # 6 hours
+            86400,            # 1 day
+            7 * 86400,        # 1 week
+            30 * 86400,       # ~1 month
+            91 * 86400,       # ~quarter
+            365 * 86400,      # ~year
+            730 * 86400,      # ~2 years
+            1825 * 86400,     # ~5 years
+            3650 * 86400,     # ~10 years
+        ]
+        interval = nice_intervals[-1]
+        for ni in nice_intervals:
+            if vis_span / ni <= 12:
+                interval = ni
+                break
+
+        # Choose label format based on interval
+        if interval <= 86400:
+            fmt = "%Y-%m-%d %H:%M"
+        elif interval <= 91 * 86400:
+            fmt = "%Y-%m-%d"
+        else:
+            fmt = "%Y-%m"
+
+        vp_w = vp.width()
+        AXIS_H = 28
+
+        self.axis_scene.clear()
+        self.axis_scene.setSceneRect(0, 0, vp_w, AXIS_H)
+        self.axis_view.resetTransform()
+
+        dark = is_dark_theme()
+        _gc = QColor("#444444") if dark else QColor("#e0e0e0")
+        _tc = QColor("#aaaaaa") if dark else QColor("#666666")
+
+        app_pt = QApplication.instance().font().pointSize()
+        tick_font = QFont("Monospace", max(5, app_pt - 2))
+
+        # Separator at top
+        sep = QGraphicsLineItem(0, 0, vp_w, 0)
+        sep.setPen(QPen(_gc, 1))
+        self.axis_scene.addItem(sep)
+
+        # Draw ticks
+        t = (int(vis_t_start / interval) + 1) * interval
+        while t < vis_t_end:
+            # scene-x in main view
+            sx = lw + (t - t_min) * pps
+            # map to pixel-x in axis viewport
+            pt = self.view.mapFromScene(sx, 0)
+            px = pt.x()
+
+            if 0 <= px <= vp_w:
+                tick = QGraphicsLineItem(px, 0, px, 6)
+                tick.setPen(QPen(_tc, 1))
+                self.axis_scene.addItem(tick)
+
+                label_str = datetime.fromtimestamp(
+                    t, tz=_tz.utc
+                ).strftime(fmt)
+                lbl = QGraphicsSimpleTextItem(label_str)
+                lbl.setFont(tick_font)
+                lbl.setBrush(QBrush(_tc))
+                lbl.setPos(px - 25, 6)
+                self.axis_scene.addItem(lbl)
+            t += interval
+
+    def update_timeline(self, loaded_files):
+        self.scene.clear()
+        self.axis_scene.clear()
+        groups = self.group_stations(loaded_files)
+        if not groups:
+            self.info_label.setText("No data")
+            return
+
+        rows = self.build_rows(groups)
+        if not rows:
+            self.info_label.setText("No data")
+            return
+
+        all_ts = []
+        for r in rows:
+            for seg in r['segments']:
+                all_ts.extend([seg['start'], seg['end']])
+        t_min = min(all_ts)
+        t_max = max(all_ts)
+        span = max(t_max - t_min, 86400)  # at least 1 day
+
+        self._t_min = t_min
+        self._span = span
+
+        self.draw(rows, t_min, span)
+
+        n_sta = sum(1 for r in rows if r['kind'] == 'station')
+        n_ch = len(rows) - n_sta
+        self.info_label.setText(
+            f"{n_sta} stations, {n_ch} channels"
+        )
+        QTimer.singleShot(50, self.view.zoom_fit)
+
+    def group_stations(self, loaded_files):
+        groups = {}
+        for _fp, inv in loaded_files.items():
+            for net in inv.networks:
+                for sta in net.stations:
+                    key = f"{net.code}.{sta.code}"
+                    groups.setdefault(key, []).append(
+                        (sta, net.code)
+                    )
+        return groups
+
+    def build_rows(self, groups):
+        rows = []
+        color_idx = 0
+        now_ts = datetime.now(tz=_tz.utc).timestamp()
+
+        for sta_key in sorted(groups.keys()):
+            entries = groups[sta_key]
+            base = BASE_COLORS[
+                color_idx % len(BASE_COLORS)
+            ]
+            color_idx += 1
+
+            sta_segs = []
+            prev_params = None
+            seg_idx = 0
+            for sta, net_code in sorted(
+                entries,
+                key=lambda e: utc_to_ts(
+                    e[0].creation_date
+                ) or 0,
+            ):
+                s = utc_to_ts(sta.creation_date)
+                e = utc_to_ts(sta.termination_date)
+                if s is None:
+                    starts = [
+                        utc_to_ts(c.start_date)
+                        for c in sta.channels
+                        if utc_to_ts(c.start_date)
+                    ]
+                    s = min(starts) if starts else 946684800
+                if e is None:
+                    e = now_ts
+
+                cur_params = (
+                    round(sta.latitude, 5),
+                    round(sta.longitude, 5),
+                    round(sta.elevation, 2),
+                    len(sta.channels),
+                )
+                if (
+                    prev_params
+                    and cur_params != prev_params
+                ):
+                    seg_idx += 1
+                prev_params = cur_params
+
+                color = shift_color(base, seg_idx)
+                tip = (
+                    f"Station: {sta_key}\n"
+                    f"Lat: {sta.latitude}  "
+                    f"Lon: {sta.longitude}\n"
+                    f"Elev: {sta.elevation} m\n"
+                    f"Channels: {len(sta.channels)}\n"
+                    f"{ts_to_label(s)} \u2192 "
+                    f"{ts_to_label(e)}"
+                )
+                sta_segs.append({
+                    'start': s, 'end': e,
+                    'color': color, 'tooltip': tip,
+                })
+
+            rows.append({
+                'label': sta_key,
+                'segments': sta_segs,
+                'kind': 'station',
+                'group': sta_key,
+            })
+
+            # --- channel-level rows ---
+            chan_map = {}
+            for sta, _nc in entries:
+                for ch in sta.channels:
+                    loc = ch.location_code or "--"
+                    k = (loc, ch.code)
+                    chan_map.setdefault(k, []).append(
+                        (ch, sta)
+                    )
+
+            for (loc, code), epoch_list in sorted(
+                chan_map.items()
+            ):
+                segs = []
+                epoch_list.sort(
+                    key=lambda x: utc_to_ts(
+                        x[0].start_date
+                    ) or 0
+                )
+                for ci, (ch, sta) in enumerate(
+                    epoch_list
+                ):
+                    s = utc_to_ts(ch.start_date)
+                    e = utc_to_ts(ch.end_date)
+                    if s is None:
+                        s = utc_to_ts(
+                            sta.creation_date
+                        ) or 946684800
+                    if e is None:
+                        e = now_ts
+                    seg_c = shift_color(base, ci)
+                    tip = (
+                        f"{sta_key}.{loc}.{code}\n"
+                        f"Lat: {ch.latitude}  "
+                        f"Lon: {ch.longitude}\n"
+                        f"Depth: {ch.depth} m  "
+                        f"SR: {ch.sample_rate} Hz\n"
+                        f"Az: {ch.azimuth}\u00b0  "
+                        f"Dip: {ch.dip}\u00b0\n"
+                        f"{ts_to_label(s)} \u2192 "
+                        f"{ts_to_label(e)}"
+                    )
+                    if (
+                        ch.response
+                        and ch.response.instrument_sensitivity
+                    ):
+                        sens = (
+                            ch.response.instrument_sensitivity
+                        )
+                        tip += (
+                            f"\nSensitivity: {sens.value}"
+                            f" {sens.input_units}"
+                        )
+                    segs.append({
+                        'start': s, 'end': e,
+                        'color': seg_c, 'tooltip': tip,
+                    })
+                rows.append({
+                    'label': f"  {loc}.{code}",
+                    'segments': segs,
+                    'kind': 'channel',
+                    'group': sta_key,
+                })
+        return rows
+
+    def draw(self, rows, t_min, span):
+        rh = self.ROW_H
+        lw = self.LABEL_W
+        px_per_sec = 800.0 / span
+        self._pps = px_per_sec
+
+        total_h = len(rows) * rh
+        total_w = lw + span * px_per_sec + 20
+
+        self.scene.setSceneRect(
+            0, 0, total_w, total_h
+        )
+
+        dark = is_dark_theme()
+        pal = QApplication.instance().palette()
+        text_color = pal.color(pal.Text)
+        sep_color = QColor("#555555") if dark else QColor("#cccccc")
+        grid_color = QColor("#444444") if dark else QColor("#e0e0e0")
+        tick_color = QColor("#aaaaaa") if dark else QColor("#666666")
+
+        app_pt = QApplication.instance().font().pointSize()
+        label_font = QFont("Monospace", max(6, app_pt - 1))
+        label_font_bold = QFont("Monospace", max(6, app_pt - 1), QFont.Bold)
+        prev_group = None
+
+        for yi, row in enumerate(rows):
+            y_top = yi * rh
+
+            if (
+                prev_group is not None
+                and row['group'] != prev_group
+            ):
+                line = QGraphicsLineItem(
+                    0, y_top, total_w, y_top
+                )
+                line.setPen(
+                    QPen(sep_color, 0.5, Qt.DashLine)
+                )
+                self.scene.addItem(line)
+            prev_group = row['group']
+
+            # label
+            txt = QGraphicsSimpleTextItem(row['label'])
+            txt.setBrush(QBrush(text_color))
+            if row['kind'] == 'station':
+                txt.setFont(label_font_bold)
+            else:
+                txt.setFont(label_font)
+            txt.setPos(2, y_top + 3)
+            self.scene.addItem(txt)
+
+            # bars
+            for seg in row['segments']:
+                x = lw + (seg['start'] - t_min) * px_per_sec
+                w = (seg['end'] - seg['start']) * px_per_sec
+                w = max(w, 2)  # minimum visible px
+                h = rh - 4 if row['kind'] == 'channel' \
+                    else rh - 2
+                y_bar = y_top + (rh - h) / 2
+
+                bar = _BarItem(
+                    x, y_bar, w, h,
+                    seg['color'], seg['tooltip'],
+                )
+                self.scene.addItem(bar)
+
+        self.draw_time_axis(
+            t_min, span, px_per_sec, total_h, lw,
+            total_w, grid_color, tick_color,
+        )
+
+    def draw_time_axis(
+        self, t_min, span, pps, total_h, lw,
+        total_w, grid_color=None, tick_color=None,
+    ):
+
+        nice_intervals = [
+            86400,          # 1 day
+            7 * 86400,      # 1 week
+            30 * 86400,     # ~1 month
+            91 * 86400,     # ~quarter
+            365 * 86400,    # ~year
+            730 * 86400,    # ~2 years
+            1825 * 86400,   # ~5 years
+            3650 * 86400,   # ~10 years
+        ]
+        interval = nice_intervals[0]
+        for ni in nice_intervals:
+            if span / ni <= 15:
+                interval = ni
+                break
+        else:
+            interval = nice_intervals[-1]
+
+        _gc = grid_color if grid_color else QColor("#e0e0e0")
+        pen_grid = QPen(_gc, 0.5, Qt.DotLine)
+
+        t = (int(t_min / interval) + 1) * interval
+        while t < t_min + span:
+            x = lw + (t - t_min) * pps
+            gl = QGraphicsLineItem(x, 0, x, total_h)
+            gl.setPen(pen_grid)
+            self.scene.addItem(gl)
+            t += interval

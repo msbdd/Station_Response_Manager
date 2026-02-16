@@ -3,6 +3,8 @@ from obspy import read_inventory
 import os
 import sys
 import re
+import colorsys
+from datetime import datetime, timezone as _tz
 
 
 def parse_response(path):
@@ -75,3 +77,48 @@ def natural_sort_key(s: str):
         (0, int(chunk)) if chunk.isdigit() else (1, chunk.lower())
         for chunk in re.split(r"(\d+)", s)
     ]
+
+
+def utc_to_ts(utc):
+    if utc is None:
+        return None
+    try:
+        return utc.datetime.replace(tzinfo=_tz.utc).timestamp()
+    except Exception:
+        return None
+
+
+def ts_to_label(ts):
+    return datetime.fromtimestamp(
+        ts, tz=_tz.utc
+    ).strftime("%Y-%m-%d")
+
+
+def shift_color(base_hex, index):
+    if index == 0:
+        return base_hex
+    r = int(base_hex[1:3], 16)
+    g = int(base_hex[3:5], 16)
+    b = int(base_hex[5:7], 16)
+    h, s, v = colorsys.rgb_to_hsv(r / 255, g / 255, b / 255)
+    h = (h + 0.10 * index) % 1.0
+    s = max(0.25, s - 0.08 * index)
+    r2, g2, b2 = colorsys.hsv_to_rgb(h, s, v)
+    return "#{:02x}{:02x}{:02x}".format(
+        int(r2 * 255), int(g2 * 255), int(b2 * 255)
+    )
+
+
+BASE_COLORS = [
+    "#4e79a7", "#f28e2b", "#e15759", "#76b7b2",
+    "#59a14f", "#edc948", "#b07aa1", "#ff9da7",
+    "#9c755f", "#bab0ac",
+]
+
+
+def is_dark_theme():
+    from PyQt5.QtWidgets import QApplication
+    pal = QApplication.instance().palette()
+    bg = pal.color(pal.Window)
+    # luminance: dark if < 128
+    return (bg.red() * 0.299 + bg.green() * 0.587 + bg.blue() * 0.114) < 128
