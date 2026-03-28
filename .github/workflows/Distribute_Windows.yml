@@ -50,9 +50,11 @@ jobs:
       run: |
         Compress-Archive -Path ("build\Station_Response_Manager_" + $env:VERSION + "_Windows") -DestinationPath ("Station_Response_Manager_" + $env:VERSION + "_Windows.zip")
     - name: Upload Release Asset
-      uses: softprops/action-gh-release@v2
-      with:
-        files: |
-          Station_Response_Manager_${{ github.ref_name }}_Windows.zip
       env:
-        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      run: |
+        gh release view "$env:VERSION" *> $null
+        if ($LASTEXITCODE -ne 0) {
+          gh release create "$env:VERSION" --title "$env:VERSION" --notes ""
+        }
+        gh release upload "$env:VERSION" ("Station_Response_Manager_" + $env:VERSION + "_Windows.zip") --clobber
