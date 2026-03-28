@@ -1,4 +1,5 @@
 # core/parser.py
+from copy import deepcopy
 from obspy import read_inventory
 import os
 import sys
@@ -15,19 +16,19 @@ def parse_response(path):
 
 
 def combine_resp(sensor_resp, recorder_resp):
-    recorder_resp.response_stages.pop(0)
-    sensor_stage0 = sensor_resp.response_stages[0]
-    recorder_resp.response_stages.insert(0, sensor_stage0)
-    recorder_resp.instrument_sensitivity.input_units = \
+    result = deepcopy(recorder_resp)
+    sensor_stage0 = deepcopy(sensor_resp.response_stages[0])
+    result.response_stages.pop(0)
+    result.response_stages.insert(0, sensor_stage0)
+    result.instrument_sensitivity.input_units = \
         sensor_stage0.input_units
-    recorder_resp.instrument_sensitivity.input_units_description = \
+    result.instrument_sensitivity.input_units_description = \
         sensor_stage0.input_units_description
     try:
-        recorder_resp.recalculate_overall_sensitivity()
+        result.recalculate_overall_sensitivity()
     except ValueError:
-        msg = "Failed to recalculate overall sensitivity."
-        print(msg)
-    return recorder_resp
+        pass
+    return result
 
 
 def wrap_text(text, max_len=75):
