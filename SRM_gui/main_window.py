@@ -34,7 +34,7 @@ from PyQt5.QtWidgets import (
 )
 from copy import deepcopy
 from PyQt5.QtWebEngineWidgets import QWebEngineView
-from PyQt5.QtGui import QColor, QFont, QBrush, QPen
+from PyQt5.QtGui import QColor, QFont, QBrush, QPen, QTransform
 from PyQt5.QtCore import Qt, QTimer, QDateTime
 from SRM_core.utils import (
     combine_resp,
@@ -773,7 +773,10 @@ class ManagerTab(QWidget):
     def on_right_tab_changed(self, index):
         widget = self.right_tabs.widget(index)
         if widget is self.timeline_widget:
-            QTimer.singleShot(50, self.timeline_widget.view.zoom_fit)
+            if self.timeline_widget._needs_initial_fit:
+                QTimer.singleShot(
+                    50, self.timeline_widget._initial_fit
+                )
 
     def update_timeline(self):
         self.timeline_widget.update_timeline(
@@ -2880,7 +2883,9 @@ class _BarItem(QGraphicsRectItem):
         qc.setAlpha(220)
         self.setBrush(QBrush(qc))
         border = QColor("#333333") if is_dark_theme() else QColor("white")
-        self.setPen(QPen(border, 0.5))
+        pen = QPen(border, 0.5)
+        pen.setCosmetic(True)
+        self.setPen(pen)
         self.setAcceptHoverEvents(True)
         self._tip = tooltip
 
@@ -2897,51 +2902,76 @@ class TimelineView(QGraphicsView):
 
     def __init__(self, parent=None):
         super().__init__(parent)
+        self.setFrameShape(self.NoFrame)
         self.setDragMode(QGraphicsView.ScrollHandDrag)
         self.setTransformationAnchor(
             QGraphicsView.AnchorUnderMouse
         )
         self.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOn)
         self.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOn)
-        self._zoom = 0
+        self._x_scale = 1.0
+        self._y_scale = 1.0
         self._timeline_widget = None
 
     def wheelEvent(self, event):
-        if event.modifiers() & Qt.ShiftModifier:
-            super().wheelEvent(event)
-        else:
+        mods = event.modifiers()
+        ctrl = bool(mods & Qt.ControlModifier)
+        shift = bool(mods & Qt.ShiftModifier)
+
+        if ctrl and shift:
+            # Ctrl+Shift+wheel → zoom X (time)
             delta = event.angleDelta().y()
-            if delta > 0:
-                factor = 1.15
-                self._zoom += 1
-            else:
-                factor = 1 / 1.15
-                self._zoom -= 1
-            self.scale(factor, factor)
+            factor = 1.15 if delta > 0 else 1 / 1.15
+            self._x_scale *= factor
+            self._apply_transform(event.pos())
             self._notify_sync()
+        elif ctrl:
+            # Ctrl+wheel → change visible rows
+            delta = event.angleDelta().y()
+            if self._timeline_widget:
+                step = max(1, abs(delta) // 120)
+                if delta > 0:
+                    step = -step  # scroll up → fewer rows
+                self._timeline_widget.adjust_visible_rows(step)
+        else:
+            # Normal scroll
+            super().wheelEvent(event)
+
+    def _apply_transform(self, anchor=None):
+        """Rebuild the transform from tracked x/y scales."""
+        if anchor is not None:
+            old_scene_pt = self.mapToScene(anchor)
+
+        t = QTransform()
+        t.scale(self._x_scale, self._y_scale)
+        self.setTransform(t)
+
+        if anchor is not None:
+            new_vp_pt = self.mapFromScene(old_scene_pt)
+            delta = new_vp_pt - anchor
+            hs = self.horizontalScrollBar()
+            vs = self.verticalScrollBar()
+            hs.setValue(hs.value() + delta.x())
+            vs.setValue(vs.value() + delta.y())
 
     def zoom_in(self):
-        self.scale(1.25, 1.25)
-        self._zoom += 1
+        self._x_scale *= 1.25
+        self._apply_transform()
         self._notify_sync()
 
     def zoom_out(self):
-        self.scale(1 / 1.25, 1 / 1.25)
-        self._zoom -= 1
+        self._x_scale /= 1.25
+        self._apply_transform()
         self._notify_sync()
 
     def zoom_fit(self):
-        if self.scene():
-            self.fitInView(
-                self.scene().sceneRect(),
-                Qt.KeepAspectRatio,
-            )
-            self._zoom = 0
-            self._notify_sync()
+        if self._timeline_widget:
+            self._timeline_widget.reset_view()
 
     def _notify_sync(self):
         if self._timeline_widget:
             self._timeline_widget.sync_axis()
+            self._timeline_widget.sync_labels()
 
     def scrollContentsBy(self, dx, dy):
         super().scrollContentsBy(dx, dy)
@@ -2949,6 +2979,9 @@ class TimelineView(QGraphicsView):
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
+        if (self._timeline_widget
+                and self._timeline_widget._needs_initial_fit):
+            self._timeline_widget._initial_fit()
         self._notify_sync()
 
 
@@ -2961,17 +2994,34 @@ class TimelineWidget(QWidget):
         super().__init__(parent)
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(2)
+        layout.setSpacing(0)
 
         ctrl = QHBoxLayout()
         ctrl.setContentsMargins(4, 2, 4, 0)
-        self.btn_zin = QPushButton("+")
-        self.btn_zout = QPushButton("\u2013")  # en-dash
-        self.btn_fit = QPushButton("Fit")
-        for b in (self.btn_zin, self.btn_zout, self.btn_fit):
+        self.btn_zin = QPushButton("T+")
+        self.btn_zin.setToolTip("Zoom in on Time axis")
+        self.btn_zout = QPushButton("T\u2013")
+        self.btn_zout.setToolTip("Zoom out on Time axis")
+        self.btn_rin = QPushButton("R+")
+        self.btn_rin.setToolTip("Show more rows")
+        self.btn_rout = QPushButton("R\u2013")
+        self.btn_rout.setToolTip("Show fewer rows")
+        self.btn_all = QPushButton("All")
+        self.btn_all.setToolTip("Fit all rows and full time range")
+        self.btn_rst = QPushButton("Rst")
+        self.btn_rst.setToolTip("Reset to 10 rows, top-left, fit time")
+        for b in (self.btn_zin, self.btn_zout,
+                  self.btn_rin, self.btn_rout,
+                  self.btn_all, self.btn_rst):
             b.setFixedWidth(36)
             b.setFixedHeight(22)
             ctrl.addWidget(b)
+        hint = QLabel(
+            "  Ctrl+\u2638 Rows  "
+            "Ctrl+Shift+\u2638 Time"
+        )
+        hint.setStyleSheet("color: gray; font-size: 10px;")
+        ctrl.addWidget(hint)
         ctrl.addStretch()
         self.info_label = QLabel("")
         self.info_label.setStyleSheet(
@@ -2980,16 +3030,46 @@ class TimelineWidget(QWidget):
         ctrl.addWidget(self.info_label)
         layout.addLayout(ctrl)
 
-        # --- graphics view ---
+        # --- middle row: frozen label view | main timeline view ---
+        mid_layout = QHBoxLayout()
+        mid_layout.setContentsMargins(0, 0, 0, 0)
+        mid_layout.setSpacing(0)
+
+        # Frozen label panel (left side)
+        self.label_scene = QGraphicsScene(self)
+        self.label_view = QGraphicsView(self)
+        self.label_view.setScene(self.label_scene)
+        self.label_view.setFixedWidth(self.LABEL_W)
+        self.label_view.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.label_view.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.label_view.setInteractive(False)
+        self.label_view.setFrameShape(self.label_view.NoFrame)
+        self.label_view.setAlignment(Qt.AlignTop | Qt.AlignLeft)
+        self.label_view.setBackgroundBrush(
+            QBrush(self.palette().color(self.palette().Base))
+        )
+        mid_layout.addWidget(self.label_view)
+
+        # Main graphics view (bars / timeline)
         self.scene = QGraphicsScene(self)
         self.view = TimelineView(self)
         self.view.setScene(self.scene)
         self.view.setBackgroundBrush(
             QBrush(self.palette().color(self.palette().Base))
         )
-        layout.addWidget(self.view)
+        mid_layout.addWidget(self.view)
+        layout.addLayout(mid_layout)
 
-        # --- fixed time-axis view (always visible at bottom) ---
+        # --- bottom row: spacer | fixed time-axis view ---
+        bot_layout = QHBoxLayout()
+        bot_layout.setContentsMargins(0, 0, 0, 0)
+        bot_layout.setSpacing(0)
+
+        self._axis_spacer = QWidget()
+        self._axis_spacer.setFixedWidth(self.LABEL_W)
+        self._axis_spacer.setFixedHeight(28)
+        bot_layout.addWidget(self._axis_spacer)
+
         self.axis_scene = QGraphicsScene(self)
         self.axis_view = QGraphicsView(self)
         self.axis_view.setScene(self.axis_scene)
@@ -3001,13 +3081,91 @@ class TimelineWidget(QWidget):
         self.axis_view.setBackgroundBrush(
             QBrush(self.palette().color(self.palette().Base))
         )
-        layout.addWidget(self.axis_view)
+        bot_layout.addWidget(self.axis_view)
+        layout.addLayout(bot_layout)
 
         self.view._timeline_widget = self
+        self._visible_rows = 10
+        self._total_rows = 0
+        self._needs_initial_fit = False
+        self._grid_items = []
 
         self.btn_zin.clicked.connect(self.view.zoom_in)
         self.btn_zout.clicked.connect(self.view.zoom_out)
-        self.btn_fit.clicked.connect(self.view.zoom_fit)
+        self.btn_rin.clicked.connect(
+            lambda: self.adjust_visible_rows(1)
+        )
+        self.btn_rout.clicked.connect(
+            lambda: self.adjust_visible_rows(-1)
+        )
+        self.btn_all.clicked.connect(self.fit_all)
+        self.btn_rst.clicked.connect(self.reset_view)
+
+    def sync_labels(self):
+        if not self.view.scene() or not hasattr(self, '_rows'):
+            return
+
+        self.label_scene.clear()
+        vp = self.view.viewport().rect()
+        visible = self.view.mapToScene(vp).boundingRect()
+        lw = self.LABEL_W
+        rh = self.ROW_H
+        label_vp_h = self.label_view.viewport().rect().height()
+
+        self.label_scene.setSceneRect(0, 0, lw, label_vp_h)
+        self.label_view.resetTransform()
+
+        dark = is_dark_theme()
+        pal = QApplication.instance().palette()
+        text_color = pal.color(pal.Text)
+        sep_color = QColor("#555555") if dark else QColor("#cccccc")
+
+        app_pt = QApplication.instance().font().pointSize()
+        label_font = QFont("Monospace", max(6, app_pt - 1))
+        label_font_bold = QFont("Monospace", max(6, app_pt - 1), QFont.Bold)
+
+        prev_group = None
+        for yi, row in enumerate(self._rows):
+            y_top = yi * rh
+            y_bot = y_top + rh
+
+            # Skip rows outside the visible vertical range
+            if y_bot < visible.y() or y_top > visible.bottom():
+                prev_group = row['group']
+                continue
+
+            # Map scene-y to viewport pixel-y
+            pt_top = self.view.mapFromScene(0, y_top)
+            py = pt_top.y()
+            pt_bot = self.view.mapFromScene(0, y_bot)
+            row_px_h = pt_bot.y() - py
+
+            # Group separator
+            if (
+                prev_group is not None
+                and row['group'] != prev_group
+            ):
+                sep = QGraphicsLineItem(0, py, lw, py)
+                sep.setPen(QPen(sep_color, 0.5, Qt.DashLine))
+                self.label_scene.addItem(sep)
+            prev_group = row['group']
+
+            # Label
+            txt = QGraphicsSimpleTextItem(row['label'])
+            txt.setBrush(QBrush(text_color))
+            if row['kind'] == 'station':
+                txt.setFont(label_font_bold)
+            else:
+                txt.setFont(label_font)
+            txt.setPos(
+                        2,
+                        py + max(
+                            1,
+                            (row_px_h - txt.boundingRect().height()) / 2
+                        )
+                    )
+
+            self.label_scene.addItem(txt)
 
     def sync_axis(self):
         if not hasattr(self, '_t_min') or not self.view.scene():
@@ -3016,41 +3174,47 @@ class TimelineWidget(QWidget):
         vp = self.view.viewport().rect()
         visible = self.view.mapToScene(vp).boundingRect()
 
-        lw = self.LABEL_W
         pps = self._pps
         t_min = self._t_min
 
         # Convert visible scene-x range to time range
-        vis_t_start = t_min + max(0, visible.x() - lw) / pps
-        vis_t_end = t_min + max(0, visible.right() - lw) / pps
-        vis_span = max(vis_t_end - vis_t_start, 1)
+        vis_t_start = t_min + max(0, visible.x()) / pps
+        vis_t_end = t_min + max(0, visible.right()) / pps
 
-        # Pick a nice tick interval for the visible range
-        nice_intervals = [
-            3600,             # 1 hour
-            6 * 3600,         # 6 hours
-            86400,            # 1 day
-            7 * 86400,        # 1 week
-            30 * 86400,       # ~1 month
-            91 * 86400,       # ~quarter
-            365 * 86400,      # ~year
-            730 * 86400,      # ~2 years
-            1825 * 86400,     # ~5 years
-            3650 * 86400,     # ~10 years
+        # Effective pixels-per-second in the viewport
+        eff_pps = pps * self.view._x_scale
+        # Minimum pixel gap between major ticks
+        MIN_PX = 80
+
+        # Candidate intervals (ascending), with minor sub,
+        # label format
+        candidates = [
+            (60,              15,             "%H:%M:%S"),
+            (300,             60,             "%H:%M"),
+            (900,             300,            "%H:%M"),
+            (3600,            900,            "%H:%M"),
+            (6 * 3600,        3600,           "%Y-%m-%d %H:%M"),
+            (86400,           6 * 3600,       "%Y-%m-%d"),
+            (7 * 86400,       86400,          "%Y-%m-%d"),
+            (30 * 86400,      7 * 86400,      "%Y-%m-%d"),
+            (91 * 86400,      30 * 86400,     "%Y-%m"),
+            (365 * 86400,     91 * 86400,     "%Y-%m"),
+            (730 * 86400,     182 * 86400,    "%Y"),
+            (1825 * 86400,    365 * 86400,    "%Y"),
+            (3650 * 86400,    730 * 86400,    "%Y"),
         ]
-        interval = nice_intervals[-1]
-        for ni in nice_intervals:
-            if vis_span / ni <= 12:
-                interval = ni
+
+        # Pick smallest interval whose pixel width >= MIN_PX
+        interval, minor_iv, fmt = candidates[-1]
+        for iv, miv, f in candidates:
+            if iv * eff_pps >= MIN_PX:
+                interval, minor_iv, fmt = iv, miv, f
                 break
 
-        # Choose label format based on interval
-        if interval <= 86400:
-            fmt = "%Y-%m-%d %H:%M"
-        elif interval <= 91 * 86400:
-            fmt = "%Y-%m-%d"
-        else:
-            fmt = "%Y-%m"
+        # Ensure minor ticks also respect a min gap
+        MIN_MINOR_PX = 15
+        if minor_iv * eff_pps < MIN_MINOR_PX:
+            minor_iv = interval  # disable minor ticks
 
         vp_w = vp.width()
         AXIS_H = 28
@@ -3071,15 +3235,50 @@ class TimelineWidget(QWidget):
         sep.setPen(QPen(_gc, 1))
         self.axis_scene.addItem(sep)
 
-        # Draw ticks
-        t = (int(vis_t_start / interval) + 1) * interval
-        while t < vis_t_end:
-            # scene-x in main view
-            sx = lw + (t - t_min) * pps
-            # map to pixel-x in axis viewport
+        # --- Dynamic grid lines in main scene ---
+        for item in self._grid_items:
+            self.scene.removeItem(item)
+        self._grid_items.clear()
+
+        total_h = self.scene.sceneRect().height()
+        pen_major_grid = QPen(_gc, 0.5, Qt.DotLine)
+        pen_major_grid.setCosmetic(True)
+
+        # Extend by one interval each side for scroll coverage
+        g_start = vis_t_start - interval
+        g_end = vis_t_end + interval
+
+        # -- Minor ticks in axis panel only (no grid lines) --
+        if minor_iv < interval:
+            t = (int(g_start / minor_iv)) * minor_iv
+            while t <= g_end:
+                # Skip positions that coincide with major
+                rem = t % interval
+                if abs(rem) < 1 or abs(rem - interval) < 1:
+                    t += minor_iv
+                    continue
+                sx = (t - t_min) * pps
+                pt = self.view.mapFromScene(sx, 0)
+                px = pt.x()
+                if 0 <= px <= vp_w:
+                    tk = QGraphicsLineItem(px, 0, px, 3)
+                    tk.setPen(QPen(_tc, 0.5))
+                    self.axis_scene.addItem(tk)
+                t += minor_iv
+
+        # -- Major ticks + labels (axis) + major grid (scene) --
+        t = (int(g_start / interval)) * interval
+        while t <= g_end:
+            sx = (t - t_min) * pps
+            # Major grid line in main scene
+            gl = QGraphicsLineItem(sx, 0, sx, total_h)
+            gl.setPen(pen_major_grid)
+            gl.setZValue(2)
+            self.scene.addItem(gl)
+            self._grid_items.append(gl)
+            # Major tick + label in axis panel
             pt = self.view.mapFromScene(sx, 0)
             px = pt.x()
-
             if 0 <= px <= vp_w:
                 tick = QGraphicsLineItem(px, 0, px, 6)
                 tick.setPen(QPen(_tc, 1))
@@ -3095,8 +3294,132 @@ class TimelineWidget(QWidget):
                 self.axis_scene.addItem(lbl)
             t += interval
 
+    def adjust_visible_rows(self, delta):
+        """Change the number of visible rows by delta."""
+        if self._total_rows == 0:
+            return
+        new_val = max(
+            1, min(self._total_rows, self._visible_rows + delta)
+        )
+        if new_val == self._visible_rows:
+            return
+        self._visible_rows = new_val
+        self._apply_y_from_visible_rows()
+        self._update_row_info()
+
+    def _apply_y_from_visible_rows(self):
+        """Recompute Y scale from _visible_rows and apply."""
+        vp_h = self.view.viewport().rect().height()
+        if vp_h <= 0:
+            return
+        target_scene_h = self._visible_rows * self.ROW_H
+        self.view._y_scale = vp_h / target_scene_h
+        self.view._apply_transform()
+        self.sync_labels()
+        self.sync_axis()
+
+    def _initial_fit(self):
+        """Set initial view: X fits visible rows, Y shows N rows."""
+        vp = self.view.viewport().rect()
+        if vp.width() < 50 or vp.height() < 50:
+            # Viewport not fully laid out; retry later
+            if self._needs_initial_fit:
+                QTimer.singleShot(100, self._initial_fit)
+            return
+        sr = self.view.scene().sceneRect()
+        if sr.width() <= 0:
+            return
+        self._needs_initial_fit = False
+
+        # Compute X range from the first _visible_rows rows
+        vis_rows = self._rows[:self._visible_rows]
+        vis_ts = []
+        for r in vis_rows:
+            for seg in r['segments']:
+                vis_ts.extend([seg['start'], seg['end']])
+        if vis_ts:
+            vis_t_min = min(vis_ts)
+            vis_t_max = max(vis_ts)
+            vis_span = max(vis_t_max - vis_t_min, 86400)
+            x_start = (vis_t_min - self._t_min) * self._pps
+            x_width = vis_span * self._pps
+            if x_width > 0:
+                self.view._x_scale = vp.width() / x_width
+            else:
+                self.view._x_scale = vp.width() / sr.width()
+        else:
+            x_start = 0
+            self.view._x_scale = vp.width() / sr.width()
+
+        # Y: show _visible_rows
+        target_scene_h = self._visible_rows * self.ROW_H
+        self.view._y_scale = vp.height() / target_scene_h
+        self.view._apply_transform()
+
+        # Scroll: X to vis_t_min, Y to top
+        hs = self.view.horizontalScrollBar()
+        hs.setValue(int(x_start * self.view._x_scale))
+        self.view.verticalScrollBar().setValue(
+            self.view.verticalScrollBar().minimum()
+        )
+
+        # Defer sync so Qt processes the transform first
+        QTimer.singleShot(0, self.sync_labels)
+        QTimer.singleShot(0, self.sync_axis)
+
+    def fit_all(self):
+        """Fit all rows and full time range."""
+        if self._total_rows == 0:
+            return
+        self._visible_rows = self._total_rows
+        self._fit_visible()
+        self._update_row_info()
+
+    def _fit_visible(self):
+        """Fit X to full scene, Y to _visible_rows."""
+        vp = self.view.viewport().rect()
+        if vp.width() < 50 or vp.height() < 50:
+            return
+        sr = self.view.scene().sceneRect()
+        if sr.width() <= 0:
+            return
+        self.view._x_scale = vp.width() / sr.width()
+        target_scene_h = self._visible_rows * self.ROW_H
+        self.view._y_scale = vp.height() / target_scene_h
+        self.view._apply_transform()
+        self.view.horizontalScrollBar().setValue(
+            self.view.horizontalScrollBar().minimum()
+        )
+        self.view.verticalScrollBar().setValue(
+            self.view.verticalScrollBar().minimum()
+        )
+        QTimer.singleShot(0, self.sync_labels)
+        QTimer.singleShot(0, self.sync_axis)
+
+    def reset_view(self):
+        """Reset to 10 visible rows, top-left, X fit to visible rows."""
+        if self._total_rows == 0:
+            return
+        self._visible_rows = min(10, self._total_rows)
+        self._needs_initial_fit = True
+        self._initial_fit()
+        self._update_row_info()
+
+    def _update_row_info(self):
+        """Update the info label with visible rows."""
+        if not hasattr(self, '_rows') or self._total_rows == 0:
+            return
+        n_sta = sum(1 for r in self._rows if r['kind'] == 'station')
+        n_ch = len(self._rows) - n_sta
+        self.info_label.setText(
+            f"Rows {self._visible_rows}/{self._total_rows}  "
+            f"({n_sta} sta, {n_ch} ch)"
+        )
+
     def update_timeline(self, loaded_files):
         self.scene.clear()
+        self._grid_items.clear()
+        self.label_scene.clear()
         self.axis_scene.clear()
         groups = self.group_stations(loaded_files)
         if not groups:
@@ -3118,15 +3441,15 @@ class TimelineWidget(QWidget):
 
         self._t_min = t_min
         self._span = span
+        self._rows = rows
 
         self.draw(rows, t_min, span)
 
-        n_sta = sum(1 for r in rows if r['kind'] == 'station')
-        n_ch = len(rows) - n_sta
-        self.info_label.setText(
-            f"{n_sta} stations, {n_ch} channels"
-        )
-        QTimer.singleShot(50, self.view.zoom_fit)
+        self._total_rows = len(rows)
+        self._visible_rows = min(10, self._total_rows)
+        self._needs_initial_fit = True
+        self._update_row_info()
+        QTimer.singleShot(50, self._initial_fit)
 
     def group_stations(self, loaded_files):
         groups = {}
@@ -3274,27 +3597,19 @@ class TimelineWidget(QWidget):
 
     def draw(self, rows, t_min, span):
         rh = self.ROW_H
-        lw = self.LABEL_W
         px_per_sec = 800.0 / span
         self._pps = px_per_sec
 
         total_h = len(rows) * rh
-        total_w = lw + span * px_per_sec + 20
+        total_w = span * px_per_sec + 20
 
         self.scene.setSceneRect(
             0, 0, total_w, total_h
         )
 
         dark = is_dark_theme()
-        pal = QApplication.instance().palette()
-        text_color = pal.color(pal.Text)
         sep_color = QColor("#555555") if dark else QColor("#cccccc")
-        grid_color = QColor("#444444") if dark else QColor("#e0e0e0")
-        tick_color = QColor("#aaaaaa") if dark else QColor("#666666")
 
-        app_pt = QApplication.instance().font().pointSize()
-        label_font = QFont("Monospace", max(6, app_pt - 1))
-        label_font_bold = QFont("Monospace", max(6, app_pt - 1), QFont.Bold)
         prev_group = None
 
         for yi, row in enumerate(rows):
@@ -3304,28 +3619,20 @@ class TimelineWidget(QWidget):
                 prev_group is not None
                 and row['group'] != prev_group
             ):
+                # separator in main scene
                 line = QGraphicsLineItem(
                     0, y_top, total_w, y_top
                 )
-                line.setPen(
-                    QPen(sep_color, 0.5, Qt.DashLine)
-                )
+                sep_pen = QPen(sep_color, 0.5, Qt.DashLine)
+                sep_pen.setCosmetic(True)
+                line.setPen(sep_pen)
+                line.setZValue(2)
                 self.scene.addItem(line)
             prev_group = row['group']
 
-            # label
-            txt = QGraphicsSimpleTextItem(row['label'])
-            txt.setBrush(QBrush(text_color))
-            if row['kind'] == 'station':
-                txt.setFont(label_font_bold)
-            else:
-                txt.setFont(label_font)
-            txt.setPos(2, y_top + 3)
-            self.scene.addItem(txt)
-
-            # bars
+            # bars (in main scene, starting at x=0)
             for seg in row['segments']:
-                x = lw + (seg['start'] - t_min) * px_per_sec
+                x = (seg['start'] - t_min) * px_per_sec
                 w = (seg['end'] - seg['start']) * px_per_sec
                 w = max(w, 2)  # minimum visible px
                 h = rh - 4 if row['kind'] == 'channel' \
@@ -3338,41 +3645,5 @@ class TimelineWidget(QWidget):
                 )
                 self.scene.addItem(bar)
 
-        self.draw_time_axis(
-            t_min, span, px_per_sec, total_h, lw,
-            total_w, grid_color, tick_color,
-        )
-
-    def draw_time_axis(
-        self, t_min, span, pps, total_h, lw,
-        total_w, grid_color=None, tick_color=None,
-    ):
-
-        nice_intervals = [
-            86400,          # 1 day
-            7 * 86400,      # 1 week
-            30 * 86400,     # ~1 month
-            91 * 86400,     # ~quarter
-            365 * 86400,    # ~year
-            730 * 86400,    # ~2 years
-            1825 * 86400,   # ~5 years
-            3650 * 86400,   # ~10 years
-        ]
-        interval = nice_intervals[0]
-        for ni in nice_intervals:
-            if span / ni <= 15:
-                interval = ni
-                break
-        else:
-            interval = nice_intervals[-1]
-
-        _gc = grid_color if grid_color else QColor("#e0e0e0")
-        pen_grid = QPen(_gc, 0.5, Qt.DotLine)
-
-        t = (int(t_min / interval) + 1) * interval
-        while t < t_min + span:
-            x = lw + (t - t_min) * pps
-            gl = QGraphicsLineItem(x, 0, x, total_h)
-            gl.setPen(pen_grid)
-            self.scene.addItem(gl)
-            t += interval
+        # Grid lines are now drawn dynamically in sync_axis
+        pass
