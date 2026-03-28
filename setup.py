@@ -7,7 +7,7 @@ import obspy
 
 mpl_data_path = matplotlib.get_data_path()
 sys.setrecursionlimit(8000)
-#sys.path.insert(0, 'src')
+# sys.path.insert(0, 'src')
 
 obsipy_data_dir = os.path.join(
     os.path.dirname(obspy.__file__), "imaging", "data"
@@ -23,7 +23,7 @@ exe = Executable(
 )
 
 setup(
-    name="Station Responce Manager",
+    name="Station Response Manager",
     version="__VERSION__",
     description="A utility for managing seismic station responces",
     options={
@@ -38,6 +38,7 @@ setup(
                 (obsipy_data_dir, "lib/obspy/imaging/data"),
                 ("SRM_gui/map_template.html", "SRM_gui/map_template.html"),
                 ("resources/icon.ico", "resources/icon.ico"),
+                ("resources/icon.png", "resources/icon.png"),
                 ("LICENSE", "LICENSE"),
             ],
             "build_exe": "build/Station_Response_Manager"
