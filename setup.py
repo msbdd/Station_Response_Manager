@@ -37,6 +37,8 @@ setup(
                 (mpl_data_path, "lib/matplotlib/mpl-data"),
                 (obsipy_data_dir, "lib/obspy/imaging/data"),
                 ("SRM_gui/map_template.html", "SRM_gui/map_template.html"),
+                ("SRM_gui/leaflet", "SRM_gui/leaflet"),
+                ("SRM_gui/tiles", "SRM_gui/tiles"),
                 ("resources/icon.ico", "resources/icon.ico"),
                 ("resources/icon.png", "resources/icon.png"),
                 ("LICENSE", "LICENSE"),

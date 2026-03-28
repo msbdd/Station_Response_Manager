@@ -12,7 +12,7 @@ from PyQt5.QtWidgets import (
 from copy import deepcopy
 from PyQt5.QtWebEngineWidgets import QWebEngineView
 from PyQt5.QtGui import QColor, QBrush
-from PyQt5.QtCore import Qt, QTimer
+from PyQt5.QtCore import Qt, QTimer, QUrl
 from SRM_gui.timeline import TimelineWidget
 import json
 import colorsys
@@ -68,7 +68,8 @@ class ManagerTab(QWidget):
         map_template_path = current_dir.parent / "map_template.html"
         with map_template_path.open("r", encoding="utf-8") as f:
             html_template = f.read()
-        self.map_view.setHtml(html_template)
+        base_url = QUrl.fromLocalFile(str(map_template_path.parent) + "/")
+        self.map_view.setHtml(html_template, base_url)
         self.right_tabs.addTab(self.map_view, "Map")
 
         self.timeline_widget = TimelineWidget()

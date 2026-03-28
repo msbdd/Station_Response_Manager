@@ -4,7 +4,7 @@
     <meta charset="utf-8" />
     <title>Local Station Map</title>
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <link rel="stylesheet" href="https://unpkg.com/leaflet/dist/leaflet.css" />
+    <link rel="stylesheet" href="leaflet/leaflet.css" />
 
     <style>
         html, body, #map {
@@ -17,14 +17,41 @@
 
 <div id="map"></div>
 
-<script src="https://unpkg.com/leaflet/dist/leaflet.js"></script>
+<script src="leaflet/leaflet.js"></script>
 
 <script>
     var map = L.map('map').setView([0, 0], 2);
 
-    L.tileLayer('https://{s}.tile.opentopomap.org/{z}/{x}/{y}.png', {
+    var CachedTileLayer = L.TileLayer.extend({
+        createTile: function(coords, done) {
+            var tile = document.createElement('img');
+            tile.alt = '';
+            tile.setAttribute('role', 'presentation');
+
+            var z = coords.z;
+            var x = coords.x;
+            var y = coords.y;
+            var onlineUrl = 'https://' + 'abc'[Math.abs(x + y) % 3]
+                + '.tile.opentopomap.org/' + z + '/' + x + '/' + y + '.png';
+
+            if (z <= 3) {
+                tile.src = 'tiles/' + z + '/' + x + '/' + y + '.png';
+                tile.onerror = function() {
+                    tile.onerror = null;
+                    tile.src = onlineUrl;
+                };
+            } else {
+                tile.src = onlineUrl;
+            }
+
+            tile.onload = function() { done(null, tile); };
+            return tile;
+        }
+    });
+
+    new CachedTileLayer('https://{s}.tile.opentopomap.org/{z}/{x}/{y}.png', {
         maxZoom: 19,
-        attribution: 'Kartendaten: © OpenStreetMap-Mitwirkende, SRTM | Kartendarstellung: © OpenTopoMap (CC-BY-SA)'
+        attribution: 'Kartendaten: &copy; OpenStreetMap-Mitwirkende, SRTM | Kartendarstellung: &copy; <a href="https://opentopomap.org">OpenTopoMap</a> (CC-BY-SA)'
     }).addTo(map);
 
     var stationLayer = L.layerGroup().addTo(map);
