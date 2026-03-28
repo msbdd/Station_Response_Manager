@@ -144,12 +144,22 @@ class DetectionResult:
 class NRLIndex:
 
     INDEX_VERSION = "0.1"
-    INDEX_FILENAME = os.path.join("resources", "nrl_response_index.json")
+    INDEX_FILENAME = "nrl_response_index.json"
+
+    @staticmethod
+    def _default_index_dir():
+        if os.name == "nt":
+            base = os.environ.get("LOCALAPPDATA", os.path.expanduser("~"))
+        else:
+            base = os.environ.get(
+                "XDG_DATA_HOME", os.path.join(os.path.expanduser("~"),
+                                              ".local", "share"))
+        return os.path.join(base, "SRM")
 
     def __init__(self, nrl_root: str, index_dir: str = None):
         self.nrl_root = os.path.normpath(nrl_root)
-        self.index_dir = index_dir or os.path.dirname(
-            os.path.dirname(__file__))
+        self.index_dir = index_dir or self._default_index_dir()
+        os.makedirs(self.index_dir, exist_ok=True)
         self.index_path = os.path.join(self.index_dir, self.INDEX_FILENAME)
 
         self._index: Optional[Dict] = None
