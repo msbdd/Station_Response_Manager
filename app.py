@@ -9,7 +9,7 @@ from SRM_gui.main_window import MainWindow
 def main():
     app = QApplication(sys.argv)
     app.setStyle('Fusion')
-    app.setDesktopFileName("Station_Response_Manager")
+    app.setDesktopFileName("SRM")
     icon = QIcon(resource_path(os.path.join('resources', 'icon.ico')))
     icon.addFile(resource_path(os.path.join('resources', 'icon.png')))
     app.setWindowIcon(icon)

@@ -72,21 +72,21 @@ jobs:
         EOF
         chmod +x "$APPDIR/AppRun"
 
-        cat > "$APPDIR/Station_Response_Manager.desktop" << 'EOF'
+        cat > "$APPDIR/SRM.desktop" << 'EOF'
         [Desktop Entry]
         Type=Application
         Name=Station Response Manager
-        Exec=srm
-        Icon=station-response-manager
+        Exec=SRM
+        Icon=SRM
         Categories=Science;
         Terminal=false
-        StartupWMClass=Station_Response_Manager
+        StartupWMClass=SRM
         EOF
 
-        cp "$APPDIR/Station_Response_Manager.desktop" "$APPDIR/usr/share/applications/Station_Response_Manager.desktop"
+        cp "$APPDIR/SRM.desktop" "$APPDIR/usr/share/applications/SRM.desktop"
 
-        cp resources/icon.png "$APPDIR/station-response-manager.png"
-        cp resources/icon.png "$APPDIR/usr/share/icons/hicolor/256x256/apps/station-response-manager.png"
+        cp resources/icon.png "$APPDIR/SRM.png"
+        cp resources/icon.png "$APPDIR/usr/share/icons/hicolor/256x256/apps/SRM.png"
 
         wget -q https://github.com/AppImage/AppImageKit/releases/download/continuous/appimagetool-x86_64.AppImage
         chmod +x appimagetool-x86_64.AppImage
