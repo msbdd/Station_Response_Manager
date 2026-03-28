@@ -73,6 +73,81 @@ def convert_inventory_to_xml(input_path: str, output_path: str):
         return False, error_message
 
 
+def validate_response(response):
+
+    issues = []
+
+    if not response:
+        issues.append(("error", "Response object is None."))
+        return issues
+
+    stages = response.response_stages
+    if not stages:
+        issues.append(("warning", "Response has no stages."))
+        return issues
+
+    # Check stage sequence numbers are consecutive starting from 1
+    for i, stage in enumerate(stages):
+        expected = i + 1
+        actual = getattr(stage, 'stage_sequence_number', None)
+        if actual is not None and actual != expected:
+            issues.append((
+                "warning",
+                f"Stage {i+1} has sequence number {actual} "
+                f"(expected {expected})."
+            ))
+
+    # Check unit chain continuity between stages
+    for i in range(len(stages) - 1):
+        out_units = getattr(stages[i], 'output_units', None)
+        in_units = getattr(stages[i + 1], 'input_units', None)
+        if out_units and in_units and out_units != in_units:
+            issues.append((
+                "warning",
+                f"Unit mismatch: stage {i+1} outputs '{out_units}' "
+                f"but stage {i+2} expects '{in_units}'."
+            ))
+
+    # Check sensitivity exists and units match first/last stage
+    sens = response.instrument_sensitivity
+    if not sens:
+        issues.append((
+            "warning",
+            "Response has no instrument sensitivity defined."
+        ))
+    else:
+        if sens.value is None or sens.value == 0:
+            issues.append((
+                "warning",
+                "Instrument sensitivity value is zero or None."
+            ))
+        first_in = getattr(stages[0], 'input_units', None)
+        if first_in and sens.input_units and first_in != sens.input_units:
+            issues.append((
+                "warning",
+                f"Sensitivity input units '{sens.input_units}' "
+                f"don't match first stage input '{first_in}'."
+            ))
+        last_out = getattr(stages[-1], 'output_units', None)
+        if last_out and sens.output_units and last_out != sens.output_units:
+            issues.append((
+                "warning",
+                f"Sensitivity output units '{sens.output_units}' "
+                f"don't match last stage output '{last_out}'."
+            ))
+
+    # Check for stages with zero gain
+    for i, stage in enumerate(stages):
+        gain = getattr(stage, 'stage_gain', None)
+        if gain is not None and gain == 0:
+            issues.append((
+                "warning",
+                f"Stage {i+1} has zero gain."
+            ))
+
+    return issues
+
+
 def natural_sort_key(s: str):
     return [
         (0, int(chunk)) if chunk.isdigit() else (1, chunk.lower())

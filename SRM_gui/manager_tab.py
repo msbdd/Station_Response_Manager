@@ -342,6 +342,7 @@ class ManagerTab(QWidget):
         chan_item = QTreeWidgetItem([f"Channel: {chan.code}"])
         chan_item.setData(0, Qt.UserRole, ("channel", chan))
         sta_item.addChild(chan_item)
+        self._add_instrument_detection(chan_item, chan)
 
         return chan_item
 
@@ -441,5 +442,7 @@ class ManagerTab(QWidget):
 
     def refresh(self):
         self.file_tree.clear()
+        self.all_stations.clear()
+        self.network_colors.clear()
         for filepath, inventory in self.main_window.loaded_files.items():
             self.add_file_to_tree(filepath, inventory)

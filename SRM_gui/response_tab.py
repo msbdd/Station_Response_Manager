@@ -26,6 +26,7 @@ from SRM_core.utils import (
     combine_resp,
     wrap_text,
     natural_sort_key,
+    validate_response,
 )
 import os
 import copy
@@ -310,6 +311,25 @@ class ResponseTab(QWidget):
                         [f"Zero {j}", f"{zero.real} + {zero.imag}j"],
                     )
                     zero_item.setData(0, Qt.UserRole, ("zero", stage, j))
+
+        issues = validate_response(response)
+        if issues:
+            issues_item = QTreeWidgetItem(
+                self.stage_tree, ["Validation Warnings", ""]
+            )
+            issues_item.setForeground(0, QBrush(QColor("#e65100")))
+            font = issues_item.font(0)
+            font.setBold(True)
+            issues_item.setFont(0, font)
+            issues_item.setExpanded(True)
+            for severity, msg in issues:
+                issue_child = QTreeWidgetItem(
+                    issues_item,
+                    [severity.upper(), msg],
+                )
+                color = "#c62828" if severity == "error" else "#e65100"
+                issue_child.setForeground(0, QBrush(QColor(color)))
+                issue_child.setForeground(1, QBrush(QColor(color)))
 
     def handle_response_edit(self, item, column):
         if column != 1:
@@ -793,6 +813,12 @@ class ResponseTab(QWidget):
             **common_params,
         )
 
+    def _renumber_stages(self):
+        for i, stage in enumerate(
+            self.selected_response.response_stages
+        ):
+            stage.stage_sequence_number = i + 1
+
     def delete(self):
         item = self.stage_tree.currentItem()
         if not item:
@@ -822,6 +848,7 @@ class ResponseTab(QWidget):
                     self.selected_response.response_stages
                 ):
                     del self.selected_response.response_stages[stage_idx]
+                    self._renumber_stages()
                     self.load_response_editor(self.selected_response)
                     return
 
@@ -999,9 +1026,24 @@ class ResponseSelectionDialog(QDialog):
     def accept(self):
         try:
             final_response = combine_resp(
-                deepcopy(self.sensor_response),
-                deepcopy(self.digitizer_response),
+                self.sensor_response,
+                self.digitizer_response,
             )
+            issues = validate_response(final_response)
+            if issues:
+                msg = "The combined response has validation issues:\n\n"
+                for severity, text in issues:
+                    msg += f"  [{severity.upper()}] {text}\n"
+                msg += "\nAccept anyway?"
+                reply = QMessageBox.warning(
+                    self,
+                    "Response Validation",
+                    msg,
+                    QMessageBox.Yes | QMessageBox.No,
+                    QMessageBox.Yes,
+                )
+                if reply != QMessageBox.Yes:
+                    return
             self.final_resp = final_response
             super().accept()
         except Exception as e:
