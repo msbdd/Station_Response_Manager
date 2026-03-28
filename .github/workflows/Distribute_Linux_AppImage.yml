@@ -80,6 +80,7 @@ jobs:
         Icon=station-response-manager
         Categories=Science;
         Terminal=false
+        StartupWMClass=Station_Response_Manager
         EOF
 
         cp "$APPDIR/Station_Response_Manager.desktop" "$APPDIR/usr/share/applications/Station_Response_Manager.desktop"

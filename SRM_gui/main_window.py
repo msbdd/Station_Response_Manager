@@ -29,7 +29,7 @@ from SRM_gui.dialogs import StationInventoryWizard, ImportFromMiniSEEDDialog
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Seismic Inventory Manager")
+        self.setWindowTitle("Station Response Manager")
         self.resize(1200, 700)
 
         self.loaded_files = {}
