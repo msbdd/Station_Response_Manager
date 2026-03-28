@@ -54,7 +54,12 @@ def wrap_text(text, max_len=75):
 
 def resource_path(relative_path):
 
-    base_path = getattr(sys, '_MEIPASS', os.path.abspath("."))
+    if getattr(sys, '_MEIPASS', None):
+        base_path = sys._MEIPASS
+    elif getattr(sys, 'frozen', False):
+        base_path = os.path.dirname(sys.executable)
+    else:
+        base_path = os.path.abspath(".")
     return os.path.join(base_path, relative_path)
 
 
