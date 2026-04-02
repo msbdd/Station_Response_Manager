@@ -20,7 +20,7 @@ from PyQt5.QtWidgets import (
     QFileDialog,
 )
 from copy import deepcopy
-from PyQt5.QtGui import QColor, QFont, QBrush
+from PyQt5.QtGui import QColor, QBrush
 from PyQt5.QtCore import Qt, QTimer
 from SRM_core.utils import (
     combine_resp,
@@ -37,7 +37,6 @@ from matplotlib.backends.backend_qt5agg import (
 from matplotlib.figure import Figure
 import numpy as np
 from obspy import read_inventory
-from obspy.core.inventory.response import Response
 from obspy.core.inventory.response import (
     ResponseStage,
     PolesZerosResponseStage,
@@ -57,6 +56,24 @@ class MplCanvas(FigureCanvas):
         self.ax_phase = self.fig.add_subplot(212, sharex=self.ax_amp)
         self.fig.tight_layout()
         super().__init__(self.fig)
+        self.apply_theme()
+
+    def apply_theme(self):
+        from SRM_core.utils import is_dark_theme
+        dark = is_dark_theme()
+        bg = "#1e1e1e" if dark else "#ffffff"
+        fg = "#e0e0e0" if dark else "#000000"
+        grid_c = "#444444" if dark else "#cccccc"
+        self.fig.set_facecolor(bg)
+        for ax in (self.ax_amp, self.ax_phase):
+            ax.set_facecolor(bg)
+            ax.tick_params(colors=fg, which="both")
+            ax.xaxis.label.set_color(fg)
+            ax.yaxis.label.set_color(fg)
+            ax.title.set_color(fg)
+            for spine in ax.spines.values():
+                spine.set_edgecolor(fg)
+            ax.grid(True, color=grid_c, alpha=0.5, linewidth=0.5)
 
 
 class ResponseTab(QWidget):
@@ -124,9 +141,16 @@ class ResponseTab(QWidget):
         self.response_layout.addWidget(splitter)
         self.plot_response(response)
 
+    def apply_theme(self):
+        self.canvas.apply_theme()
+
     def plot_response(self, response):
         self.canvas.ax_amp.clear()
         self.canvas.ax_phase.clear()
+        self.canvas.apply_theme()
+        from SRM_core.utils import is_dark_theme
+        dark = is_dark_theme()
+        fg = "#e0e0e0" if dark else "#000000"
         try:
             freq = np.logspace(-2, 2, 1000)
             h = response.get_evalresp_response_for_frequencies(
@@ -143,7 +167,9 @@ class ResponseTab(QWidget):
             self.canvas.ax_amp.set_ylabel("Amplitude")
             self.canvas.ax_amp.set_xscale("log")
             self.canvas.ax_amp.set_yscale("log")
-            self.canvas.ax_amp.legend()
+            self.canvas.ax_amp.legend(
+                facecolor="none", edgecolor="none", labelcolor=fg
+            )
 
             self.canvas.ax_phase.plot(
                 freq, phase, color="seagreen", label="Phase"
@@ -152,14 +178,16 @@ class ResponseTab(QWidget):
             self.canvas.ax_phase.set_xlabel("Frequency [Hz]")
             self.canvas.ax_phase.set_ylabel("Phase [°]")
             self.canvas.ax_phase.set_xscale("log")
-            self.canvas.ax_phase.legend()
+            self.canvas.ax_phase.legend(
+                facecolor="none", edgecolor="none", labelcolor=fg
+            )
 
         except Exception as e:
             self.canvas.ax_amp.text(
-                0.5, 0.5, f"Error plotting: {e}", ha="center"
+                0.5, 0.5, f"Error plotting: {e}", ha="center", color=fg
             )
             self.canvas.ax_phase.text(
-                0.5, 0.5, f"Error plotting: {e}", ha="center"
+                0.5, 0.5, f"Error plotting: {e}", ha="center", color=fg
             )
         self.canvas.draw()
 

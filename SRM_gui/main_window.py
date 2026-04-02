@@ -7,7 +7,9 @@ from PyQt5.QtWidgets import (
     QFileDialog,
     QAction,
     QTabBar,
+    QLabel,
 )
+from PyQt5.QtCore import QSettings
 from SRM_core.utils import (
     resource_path,
     convert_inventory_to_xml,
@@ -72,22 +74,31 @@ class MainWindow(QMainWindow):
         else:
             self.nrl_index.load_index()
 
+        self.setAcceptDrops(True)
         self.setup_menu()
         self.setup_ui()
+        self._status_label = QLabel()
+        self.statusBar().addPermanentWidget(self._status_label, 1)
+        self.update_status_bar()
 
     def setup_menu(self):
         menubar = self.menuBar()
         file_menu = menubar.addMenu("File")
         new_inventory = QAction("New Inventory", self)
+        new_inventory.setShortcut("Ctrl+N")
         new_inventory.triggered.connect(self.create_new_inventory)
         file_menu.addAction(new_inventory)
         add_data = QAction("Add Data", self)
+        add_data.setShortcut("Ctrl+O")
         add_data.triggered.connect(self.add_data)
         file_menu.addAction(add_data)
         save_all = QAction("Save All Files", self)
+        save_all.setShortcut("Ctrl+S")
         save_all.triggered.connect(self.save_all_files)
         file_menu.addAction(save_all)
+        file_menu.addSeparator()
         exit_action = QAction("Exit", self)
+        exit_action.setShortcut("Ctrl+Q")
         exit_action.triggered.connect(self.close)
         file_menu.addAction(exit_action)
         tools_menu = menubar.addMenu("Tools")
@@ -98,6 +109,11 @@ class MainWindow(QMainWindow):
         convert_to_xml.triggered.connect(self.convert_to_xml)
         tools_menu.addAction(convert_to_xml)
         view_menu = menubar.addMenu("View")
+        toggle_theme = QAction("Toggle Theme", self)
+        toggle_theme.setShortcut("Ctrl+T")
+        toggle_theme.triggered.connect(self.toggle_theme)
+        view_menu.addAction(toggle_theme)
+        view_menu.addSeparator()
         font_increase = QAction("Increase Font Size", self)
         font_increase.setShortcut("Ctrl+=")
         font_increase.triggered.connect(lambda: self._change_font_size(1))
@@ -110,6 +126,13 @@ class MainWindow(QMainWindow):
         font_reset.setShortcut("Ctrl+0")
         font_reset.triggered.connect(lambda: self._change_font_size(0))
         view_menu.addAction(font_reset)
+        view_menu.addSeparator()
+        close_tab_action = QAction("Close Tab", self)
+        close_tab_action.setShortcut("Ctrl+W")
+        close_tab_action.triggered.connect(
+            lambda: self.close_tab(self.tabs.currentIndex())
+        )
+        view_menu.addAction(close_tab_action)
 
     def _change_font_size(self, delta):
         app = QApplication.instance()
@@ -175,6 +198,7 @@ class MainWindow(QMainWindow):
                     QMessageBox.warning(
                         self, "Error", f"Failed to load {file}:\n{e}"
                     )
+        self.update_status_bar()
 
     def open_explorer_tab(self, filepath, inventory):
         key = ("explorer", filepath)
@@ -229,6 +253,7 @@ class MainWindow(QMainWindow):
             inv.write(filepath, format="STATIONXML")
             self.manager_tab.add_file_to_tree(filepath, inv)
             self.open_explorer_tab(filepath, inv)
+            self.update_status_bar()
         except Exception as e:
             QMessageBox.warning(
                 self, "Error", f"Failed to create inventory:\n{e}"
@@ -299,3 +324,78 @@ class MainWindow(QMainWindow):
         msg_box.setInformativeText(message)
         msg_box.setWindowTitle("Conversion Status")
         msg_box.exec_()
+
+    def toggle_theme(self):
+        from app import make_dark_palette
+        from SRM_core.utils import is_dark_theme
+        app = QApplication.instance()
+        settings = QSettings("SRM", "StationResponseManager")
+        if is_dark_theme():
+            app.setPalette(app.style().standardPalette())
+            settings.setValue("theme", "light")
+        else:
+            app.setPalette(make_dark_palette())
+            settings.setValue("theme", "dark")
+        if hasattr(self, 'manager_tab'):
+            self.manager_tab.refresh_theme()
+        for (tab_type, _), widget in self.open_tabs.items():
+            if tab_type == "response" and isinstance(widget, ResponseTab):
+                widget.apply_theme()
+                widget.plot_response(widget.selected_response)
+        self.update_status_bar()
+
+    def dragEnterEvent(self, event):
+        if event.mimeData().hasUrls():
+            for url in event.mimeData().urls():
+                path = url.toLocalFile().lower()
+                if path.endswith(('.xml', '.dataless', '.dless')):
+                    event.acceptProposedAction()
+                    return
+
+    def dropEvent(self, event):
+        loaded = 0
+        for url in event.mimeData().urls():
+            path = url.toLocalFile()
+            if path.lower().endswith(('.xml', '.dataless', '.dless')):
+                if self._load_file(path):
+                    loaded += 1
+        if loaded:
+            self.update_status_bar()
+
+    def _load_file(self, filepath):
+        abs_path = str(Path(filepath).resolve())
+        if abs_path in self.loaded_files:
+            return False
+        try:
+            inv = read_inventory(abs_path)
+            self.loaded_files[abs_path] = inv
+            self.manager_tab.add_file_to_tree(abs_path, inv)
+            return True
+        except Exception as e:
+            QMessageBox.warning(
+                self, "Error", f"Failed to load {filepath}:\n{e}"
+            )
+            return False
+
+    def update_status_bar(self):
+        n_files = len(self.loaded_files)
+        if n_files == 0:
+            self._status_label.setText(
+                "No data loaded \u2014 use File > Add Data or drag files here"
+            )
+            return
+        n_nets = 0
+        n_stas = 0
+        n_chans = 0
+        for inv in self.loaded_files.values():
+            for net in inv.networks:
+                n_nets += 1
+                for sta in net.stations:
+                    n_stas += 1
+                    n_chans += len(sta.channels)
+        self._status_label.setText(
+            f"{n_files} file{'s' if n_files != 1 else ''} | "
+            f"{n_nets} network{'s' if n_nets != 1 else ''} | "
+            f"{n_stas} station{'s' if n_stas != 1 else ''} | "
+            f"{n_chans} channel{'s' if n_chans != 1 else ''}"
+        )

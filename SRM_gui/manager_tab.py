@@ -441,6 +441,10 @@ class ManagerTab(QWidget):
             self.main_window.loaded_files
         )
 
+    def refresh_theme(self):
+        self.timeline_widget.refresh_theme()
+        self.update_timeline()
+
     def refresh(self):
         self.file_tree.clear()
         self.all_stations.clear()

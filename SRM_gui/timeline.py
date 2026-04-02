@@ -251,6 +251,13 @@ class TimelineWidget(QWidget):
         self.btn_all.clicked.connect(self.fit_all)
         self.btn_rst.clicked.connect(self.reset_view)
 
+    def refresh_theme(self):
+        base = self.palette().color(self.palette().Base)
+        brush = QBrush(base)
+        self.label_view.setBackgroundBrush(brush)
+        self.view.setBackgroundBrush(brush)
+        self.axis_view.setBackgroundBrush(brush)
+
     def sync_labels(self):
         if not self.view.scene() or not hasattr(self, '_rows'):
             return
