@@ -32,8 +32,12 @@ class ExplorerTab(QWidget):
         self.new_button.setEnabled(True)
         self.new_button.clicked.connect(self.create_new_field)
         top_layout.addWidget(self.object_label)
+        self.delete_button = QPushButton("Delete")
+        self.delete_button.setEnabled(False)
+        self.delete_button.clicked.connect(self.delete_selected)
         top_layout.addStretch()
         top_layout.addWidget(self.new_button)
+        top_layout.addWidget(self.delete_button)
         layout.addLayout(top_layout)
         # Filters
         search_layout = QHBoxLayout()
@@ -94,142 +98,144 @@ class ExplorerTab(QWidget):
                 self.tree.scrollToItem(sta_item)
                 return
 
+    # Editable fields per type — from ObsPy's actual attributes
+    # This needs to be changed if moved to a different ObsPy version...
+    _NETWORK_FIELDS = [
+        "alternate_code", "description", "end_date", "historical_code",
+        "restricted_status", "source_id", "start_date",
+        "total_number_of_stations",
+    ]
+    _STATION_FIELDS = [
+        "alternate_code", "creation_date", "description", "end_date",
+        "geology", "historical_code", "restricted_status", "source_id",
+        "start_date", "termination_date", "vault", "water_level",
+    ]
+    _CHANNEL_FIELDS = [
+        "alternate_code", "calibration_units",
+        "calibration_units_description",
+        "clock_drift_in_seconds_per_sample", "description", "end_date",
+        "historical_code", "restricted_status", "source_id", "start_date",
+        "water_level",
+    ]
+
+    def _find_header_item(self, item):
+        # Walk up to the nearest Network/Station/Channel header
+        while item:
+            label = item.text(0)
+            for prefix in ("Network: ", "Station: ", "Channel: "):
+                if label.startswith(prefix):
+                    return item
+            item = item.parent()
+        return None
+
+    def _get_obj_for_header(self, header_item):
+        # Get the ObsPy object for a Network/Station/Channel header
+        label = header_item.text(0)
+        inv = self.current_inventory
+        if label.startswith("Network: "):
+            code = label.replace("Network: ", "").strip()
+            return next(
+                (n for n in inv.networks if n.code == code), None
+            )
+        elif label.startswith("Station: "):
+            ref = header_item.data(0, Qt.UserRole)
+            if ref and isinstance(ref, tuple) and ref[0] == "station":
+                return ref[1]
+        elif label.startswith("Channel: "):
+            sta_header = header_item.parent()
+            if sta_header:
+                sta_ref = sta_header.data(0, Qt.UserRole)
+                if sta_ref and sta_ref[0] == "station":
+                    chan_code = label.replace("Channel: ", "").strip()
+                    for ch in sta_ref[1].channels:
+                        if ch.code == chan_code:
+                            return ch
+        return None
+
+    def _missing_fields(self, obj, whitelist):
+        # Return whitelist fields that are currently None or empty
+        return [
+            a for a in whitelist
+            if getattr(obj, a, None) in (None, "")
+        ]
+
+    @staticmethod
+    def _set_field(obj, field):
+        """Set a missing field, using a non-empty placeholder for fields
+        that ObsPy silently converts empty strings to None."""
+        # Try empty string first
+        setattr(obj, field, "")
+        if getattr(obj, field, None) is not None:
+            return
+        # ObsPy swallowed it — use a typed placeholder
+        setattr(obj, field, "—")
+
     def create_new_field(self):
         item = self.tree.currentItem()
         if not item:
             QMessageBox.warning(self, "No Selection", "Please select an item.")
             return
 
-        label_text = item.text(0)
-        parent_inventory = self.current_inventory
-
-        if label_text.startswith("Network:"):
-            net_code = label_text.replace("Network:", "").strip()
-            net = next(
-                (n for n in parent_inventory.networks if n.code == net_code),
-                None,
+        header = self._find_header_item(item)
+        if not header:
+            QMessageBox.warning(
+                self, "Invalid Selection",
+                "Select a Network, Station, Channel, or one of their fields."
             )
-            if not net:
-                QMessageBox.warning(
-                    self, "Error", "Could not find target Network."
-                )
-                return
+            return
 
+        label = header.text(0)
+        obj = self._get_obj_for_header(header)
+        if not obj:
+            QMessageBox.warning(self, "Error", "Could not resolve object.")
+            return
+
+        if label.startswith("Network: "):
+            field_choices = self._missing_fields(obj, self._NETWORK_FIELDS)
+            new_item_label = "New Station"
+        elif label.startswith("Station: "):
+            field_choices = self._missing_fields(obj, self._STATION_FIELDS)
+            new_item_label = "New Channel"
+        elif label.startswith("Channel: "):
+            field_choices = self._missing_fields(obj, self._CHANNEL_FIELDS)
+            new_item_label = None
+        else:
+            return
+
+        choices = []
+        if new_item_label:
+            choices.append(new_item_label)
+        choices.extend(field_choices)
+
+        if not choices:
+            QMessageBox.information(
+                self, "Info", "No missing editable fields."
+            )
+            return
+
+        choice, ok = QInputDialog.getItem(
+            self, "New", "Select what to add:", choices, editable=False,
+        )
+        if not ok:
+            return
+
+        if choice == "New Station":
             sta = Station(
                 code="STA", latitude=0.0, longitude=0.0, elevation=0.0
             )
-            net.stations.append(sta)
-            self.populate_tree(parent_inventory)
-            return
-
-        elif label_text.startswith("Station:"):
-            ref_data = item.data(0, Qt.UserRole)
-            if (
-                not ref_data
-                or not isinstance(ref_data, tuple)
-                or ref_data[0] != "station"
-            ):
-                QMessageBox.warning(
-                    self, "Error", "Station reference not found."
-                )
-                return
-
-            sta = ref_data[1]
-
-            # Get parent network
-            parent = item.parent()
-            net_code = None
-            while parent:
-                label = parent.text(0)
-                if label.startswith("Network:"):
-                    net_code = label.replace("Network:", "").strip()
-                    break
-                parent = parent.parent()
-
-            if not net_code:
-                QMessageBox.warning(
-                    self,
-                    "Error",
-                    "Could not find parent Network for Station.",
-                )
-                return
-
-            net = next(
-                (n for n in parent_inventory.networks if n.code == net_code),
-                None,
-            )
-            if not net:
-                QMessageBox.warning(
-                    self, "Error", "Could not find Network in inventory."
-                )
-                return
-
+            obj.stations.append(sta)
+        elif choice == "New Channel":
             chan = Channel(
-                code="BHZ",
-                location_code="",
-                latitude=sta.latitude,
-                longitude=sta.longitude,
-                depth=0.0,
-                elevation=sta.elevation,
-                azimuth=0.0,
-                dip=-90.0,
-                sample_rate=100.0,
+                code="BHZ", location_code="",
+                latitude=obj.latitude, longitude=obj.longitude,
+                depth=0.0, elevation=obj.elevation,
+                azimuth=0.0, dip=-90.0, sample_rate=100.0,
             )
             chan.response = Response()
-            sta.channels.append(chan)
-            self.populate_tree(parent_inventory)
-            return
-
-        elif label_text.startswith("Channel:"):
-            QMessageBox.information(
-                self, "Info", "Channels cannot contain sub-items."
-            )
-            return
-
-        elif label_text == "Response" or label_text.startswith("Stage"):
-            QMessageBox.information(
-                self, "Info", "Cannot add fields inside a response."
-            )
-            return
-
-        obj = self.current_obj
-        if not obj:
-            QMessageBox.warning(self, "Error", "No valid object selected.")
-            return
-
-        all_attrs = sorted(
-            [
-                attr
-                for attr in dir(obj)
-                if not attr.startswith("_")
-                and not callable(getattr(obj, attr))
-                and isinstance(
-                    getattr(obj, attr, None), (str, int, float, type(None))
-                )
-            ]
-        )
-
-        missing_attrs = [
-            a for a in all_attrs if getattr(obj, a, None) in (None, "")
-        ]
-
-        if not missing_attrs:
-            QMessageBox.information(
-                self, "Info", "No missing editable fields found."
-            )
-            return
-
-        attr, ok = QInputDialog.getItem(
-            self,
-            "Add Field",
-            "Select a field to add:",
-            missing_attrs,
-            editable=False,
-        )
-
-        if ok and attr:
-            setattr(obj, attr, "")
-            self.populate_tree(self.current_inventory)
+            obj.channels.append(chan)
+        else:
+            self._set_field(obj, choice)
+        self.populate_tree(self.current_inventory)
 
     def apply_modified_response(self, response):
         updated = False
@@ -404,30 +410,118 @@ class ExplorerTab(QWidget):
                                         )
         except Exception as e:
             QTreeWidgetItem(self.tree, ["Error", str(e)])
-        self.current_obj = None
         self._restore_tree_state(expanded, selected_path)
         self.filter_tree()
 
     def on_tree_selection_changed(self):
         item = self.tree.currentItem()
         if not item:
-            self.current_obj = None
             self.new_button.setEnabled(False)
+            self.delete_button.setEnabled(False)
             return
 
         label = item.text(0)
-        valid = True
+        in_response = label.startswith("Response") or label.startswith("Stage")
 
-        if label.startswith("Response") or label.startswith("Stage"):
-            valid = False
-
-        self.new_button.setEnabled(valid)
-
-        ref = item.data(0, Qt.UserRole)
-        if ref and isinstance(ref, tuple):
-            self.current_obj = ref[0]
+        if in_response:
+            self.new_button.setEnabled(False)
+            self.delete_button.setEnabled(False)
         else:
-            self.current_obj = None
+            self.new_button.setEnabled(
+                self._find_header_item(item) is not None
+            )
+            # Deletable: Station, Channel, or an optional property field
+            can_delete = (
+                label.startswith("Station: ")
+                or label.startswith("Channel: ")
+                or self._is_optional_field(item)
+            )
+            self.delete_button.setEnabled(can_delete)
+
+    def _is_optional_field(self, item):
+        """Check if item is a deletable (optional) property field."""
+        ref = item.data(0, Qt.UserRole)
+        if not ref or not isinstance(ref, tuple) or len(ref) != 2:
+            return False
+        _obj, field = ref
+        if not isinstance(field, str):
+            return False
+        # Don't allow deleting core required fields
+        required = {
+            "code", "latitude", "longitude", "elevation",
+            "depth", "azimuth", "dip", "sample_rate", "location_code",
+        }
+        return field not in required
+
+    def delete_selected(self):
+        item = self.tree.currentItem()
+        if not item:
+            return
+        label = item.text(0)
+
+        # Delete a Station
+        if label.startswith("Station: "):
+            ref = item.data(0, Qt.UserRole)
+            if not ref or ref[0] != "station":
+                return
+            sta = ref[1]
+            net_item = item.parent()
+            if not net_item:
+                return
+            net_label = net_item.text(0)
+            reply = QMessageBox.question(
+                self, "Delete Station",
+                f"Delete {label} from {net_label}?",
+                QMessageBox.Yes | QMessageBox.No, QMessageBox.No,
+            )
+            if reply != QMessageBox.Yes:
+                return
+            net_code = net_label.replace("Network: ", "").strip()
+            for net in self.current_inventory.networks:
+                if net.code == net_code and sta in net.stations:
+                    net.stations.remove(sta)
+                    break
+            self.populate_tree(self.current_inventory)
+            return
+
+        # Delete a Channel
+        if label.startswith("Channel: "):
+            sta_item = item.parent()
+            if not sta_item:
+                return
+            sta_ref = sta_item.data(0, Qt.UserRole)
+            if not sta_ref or sta_ref[0] != "station":
+                return
+            sta = sta_ref[1]
+            chan_code = label.replace("Channel: ", "").strip()
+            chan = next(
+                (c for c in sta.channels if c.code == chan_code), None
+            )
+            if not chan:
+                return
+            reply = QMessageBox.question(
+                self, "Delete Channel",
+                f"Delete {label} from Station: {sta.code}?",
+                QMessageBox.Yes | QMessageBox.No, QMessageBox.No,
+            )
+            if reply != QMessageBox.Yes:
+                return
+            sta.channels.remove(chan)
+            self.populate_tree(self.current_inventory)
+            return
+
+        # Delete an optional property field
+        if self._is_optional_field(item):
+            obj, field = item.data(0, Qt.UserRole)
+            reply = QMessageBox.question(
+                self, "Delete Field",
+                f"Remove field \"{field}\"?",
+                QMessageBox.Yes | QMessageBox.No, QMessageBox.No,
+            )
+            if reply != QMessageBox.Yes:
+                return
+            setattr(obj, field, None)
+            self.populate_tree(self.current_inventory)
 
     def handle_tree_edit(self, item, column):
         if column != 1:
