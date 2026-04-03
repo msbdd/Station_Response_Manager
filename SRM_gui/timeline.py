@@ -3,8 +3,8 @@ from PyQt5.QtWidgets import (
     QWidget,
     QVBoxLayout,
     QPushButton,
-    QLabel,
     QHBoxLayout,
+    QLineEdit,
     QGraphicsView,
     QGraphicsScene,
     QGraphicsRectItem,
@@ -21,11 +21,22 @@ from SRM_core.utils import (
     BASE_COLORS,
     is_dark_theme,
 )
+from fnmatch import fnmatch
 from datetime import datetime, timezone as _tz
 
 
+def _match(pattern, full_id, has_wildcards):
+    # Match a filter pattern against a SEED-style id (NET.STA.LOC.CHA)
+
+    if has_wildcards:
+        # Wrap in * if user didn't — so "HH?" matches anywhere in the id
+        glob_pat = pattern if '*' in pattern else f"*{pattern}*"
+        return fnmatch(full_id, glob_pat)
+    return pattern in full_id
+
+
 class _BarItem(QGraphicsRectItem):
-    """A single bar in the timeline with tooltip."""
+    # A single bar in the timeline with tooltip
 
     def __init__(self, x, y, w, h, color, tooltip, parent=None):
         super().__init__(x, y, w, h, parent)
@@ -88,7 +99,7 @@ class TimelineView(QGraphicsView):
             super().wheelEvent(event)
 
     def _apply_transform(self, anchor=None):
-        """Rebuild the transform from tracked x/y scales."""
+        # Rebuild the transform from tracked x/y scales
         if anchor is not None:
             old_scene_pt = self.mapToScene(anchor)
 
@@ -166,18 +177,15 @@ class TimelineWidget(QWidget):
             b.setFixedWidth(36)
             b.setFixedHeight(22)
             ctrl.addWidget(b)
-        hint = QLabel(
-            "  Ctrl+\u2638 Rows  "
-            "Ctrl+Shift+\u2638 Time"
+        ctrl.addSpacing(8)
+        self.filter_bar = QLineEdit()
+        self.filter_bar.setPlaceholderText(
+            "Filter: station, channel, NET.STA.LOC.CHA, HH?, *BHZ..."
         )
-        hint.setStyleSheet("color: gray; font-size: 10px;")
-        ctrl.addWidget(hint)
-        ctrl.addStretch()
-        self.info_label = QLabel("")
-        self.info_label.setStyleSheet(
-            "color: gray; font-size: 11px;"
-        )
-        ctrl.addWidget(self.info_label)
+        self.filter_bar.setClearButtonEnabled(True)
+        self.filter_bar.textChanged.connect(self._apply_filter)
+        ctrl.addWidget(self.filter_bar, 1)
+        ctrl.addSpacing(4)
         layout.addLayout(ctrl)
 
         # --- middle row: frozen label view | main timeline view ---
@@ -452,7 +460,7 @@ class TimelineWidget(QWidget):
             t += interval
 
     def adjust_visible_rows(self, delta):
-        """Change the number of visible rows by delta."""
+        # Change the number of visible rows by delta
         if self._total_rows == 0:
             return
         new_val = max(
@@ -462,10 +470,9 @@ class TimelineWidget(QWidget):
             return
         self._visible_rows = new_val
         self._apply_y_from_visible_rows()
-        self._update_row_info()
 
     def _apply_y_from_visible_rows(self):
-        """Recompute Y scale from _visible_rows and apply."""
+        # Recompute Y scale from _visible_rows and apply
         vp_h = self.view.viewport().rect().height()
         if vp_h <= 0:
             return
@@ -476,7 +483,7 @@ class TimelineWidget(QWidget):
         self.sync_axis()
 
     def _initial_fit(self):
-        """Set initial view: X fits visible rows, Y shows N rows."""
+        # Set initial view: X fits visible rows, Y shows N rows
         vp = self.view.viewport().rect()
         if vp.width() < 50 or vp.height() < 50:
             # Viewport not fully laid out; retry later
@@ -525,15 +532,14 @@ class TimelineWidget(QWidget):
         QTimer.singleShot(0, self.sync_axis)
 
     def fit_all(self):
-        """Fit all rows and full time range."""
+        # Fit all rows and full time range
         if self._total_rows == 0:
             return
         self._visible_rows = self._total_rows
         self._fit_visible()
-        self._update_row_info()
 
     def _fit_visible(self):
-        """Fit X to full scene, Y to _visible_rows."""
+        # Fit X to full scene, Y to _visible_rows
         vp = self.view.viewport().rect()
         if vp.width() < 50 or vp.height() < 50:
             return
@@ -554,24 +560,12 @@ class TimelineWidget(QWidget):
         QTimer.singleShot(0, self.sync_axis)
 
     def reset_view(self):
-        """Reset to 10 visible rows, top-left, X fit to visible rows."""
+        # Reset to 10 visible rows, top-left, X fit to visible rows
         if self._total_rows == 0:
             return
         self._visible_rows = min(10, self._total_rows)
         self._needs_initial_fit = True
         self._initial_fit()
-        self._update_row_info()
-
-    def _update_row_info(self):
-        """Update the info label with visible rows."""
-        if not hasattr(self, '_rows') or self._total_rows == 0:
-            return
-        n_sta = sum(1 for r in self._rows if r['kind'] == 'station')
-        n_ch = len(self._rows) - n_sta
-        self.info_label.setText(
-            f"Rows {self._visible_rows}/{self._total_rows}  "
-            f"({n_sta} sta, {n_ch} ch)"
-        )
 
     def update_timeline(self, loaded_files):
         self.scene.clear()
@@ -580,12 +574,26 @@ class TimelineWidget(QWidget):
         self.axis_scene.clear()
         groups = self.group_stations(loaded_files)
         if not groups:
-            self.info_label.setText("No data")
+            self._all_rows = []
             return
 
         rows = self.build_rows(groups)
         if not rows:
-            self.info_label.setText("No data")
+            self._all_rows = []
+            return
+
+        self._all_rows = rows
+        self._show_rows(self._filter_rows(rows))
+
+    def _show_rows(self, rows):
+        self.scene.clear()
+        self._grid_items.clear()
+        self.label_scene.clear()
+        self.axis_scene.clear()
+
+        if not rows:
+            self._rows = []
+            self._total_rows = 0
             return
 
         all_ts = []
@@ -605,8 +613,28 @@ class TimelineWidget(QWidget):
         self._total_rows = len(rows)
         self._visible_rows = min(10, self._total_rows)
         self._needs_initial_fit = True
-        self._update_row_info()
         QTimer.singleShot(50, self._initial_fit)
+
+    def _apply_filter(self):
+        if not hasattr(self, '_all_rows') or not self._all_rows:
+            return
+        self._show_rows(self._filter_rows(self._all_rows))
+
+    def _filter_rows(self, rows):
+        pattern = self.filter_bar.text().strip()
+        if not pattern:
+            return rows
+
+        pat = pattern.upper()
+        has_wildcards = any(c in pat for c in ('*', '?', '['))
+
+        visible_groups = set()
+        for row in rows:
+            fid = row['full_id'].upper()
+            if _match(pat, fid, has_wildcards):
+                visible_groups.add(row['group'])
+
+        return [r for r in rows if r['group'] in visible_groups]
 
     def group_stations(self, loaded_files):
         groups = {}
@@ -685,6 +713,7 @@ class TimelineWidget(QWidget):
                 'segments': sta_segs,
                 'kind': 'station',
                 'group': sta_key,
+                'full_id': sta_key,
             })
 
             # --- channel-level rows ---
@@ -749,6 +778,7 @@ class TimelineWidget(QWidget):
                     'segments': segs,
                     'kind': 'channel',
                     'group': sta_key,
+                    'full_id': f"{sta_key}.{loc}.{code}",
                 })
         return rows
 

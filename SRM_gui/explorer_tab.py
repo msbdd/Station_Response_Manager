@@ -35,17 +35,22 @@ class ExplorerTab(QWidget):
         top_layout.addStretch()
         top_layout.addWidget(self.new_button)
         layout.addLayout(top_layout)
-        # Search
+        # Filters
         search_layout = QHBoxLayout()
+        self.station_filter = QLineEdit()
+        self.station_filter.setPlaceholderText(
+            "Filter by network or station..."
+        )
+        self.station_filter.setClearButtonEnabled(True)
+        self.station_filter.textChanged.connect(self.filter_tree)
+        search_layout.addWidget(self.station_filter, 1)
+        search_layout.addSpacing(4)
         self.search_bar = QLineEdit()
-        self.search_bar.setPlaceholderText("Filter properties...")
-        self.clear_search_btn = QPushButton("Clear")
-        search_layout.addWidget(self.search_bar)
-        search_layout.addWidget(self.clear_search_btn)
-        layout.addLayout(search_layout)
+        self.search_bar.setPlaceholderText("Property filter...")
+        self.search_bar.setClearButtonEnabled(True)
         self.search_bar.textChanged.connect(self.filter_tree)
-        self.clear_search_btn.clicked.connect(self.search_bar.clear)
-        # Search_End
+        search_layout.addWidget(self.search_bar, 1)
+        layout.addLayout(search_layout)
         self.tree = QTreeWidget()
         self.tree.setHeaderLabels(["Field", "Value"])
         self.tree.itemChanged.connect(self.handle_tree_edit)
@@ -431,26 +436,52 @@ class ExplorerTab(QWidget):
             )
 
     def filter_tree(self):
-        search_text = self.search_bar.text().lower()
-        for i in range(self.tree.topLevelItemCount()):
-            item = self.tree.topLevelItem(i)
-            match_found = self._recursive_filter(item, search_text)
-            item.setHidden(not match_found)
+        sta_text = self.station_filter.text().strip().upper()
+        prop_text = self.search_bar.text().lower()
 
-    def _recursive_filter(self, item, search_text):
-        child_match_found = False
+        for ni in range(self.tree.topLevelItemCount()):
+            net_item = self.tree.topLevelItem(ni)
+            net_code = net_item.text(0).replace("Network: ", "").strip()
+            net_matches = not sta_text or sta_text in net_code.upper()
+
+            any_sta_visible = False
+            for si in range(net_item.childCount()):
+                sta_item = net_item.child(si)
+                label = sta_item.text(0)
+                if not label.startswith("Station: "):
+                    # property field under network — handle with prop filter
+                    self._filter_prop(sta_item, prop_text)
+                    continue
+                sta_code = label.replace("Station: ", "").strip()
+                sta_visible = net_matches or sta_text in sta_code.upper()
+
+                if sta_visible:
+                    # Station matched — apply property filter inside
+                    self._filter_prop(sta_item, prop_text)
+                    any_sta_visible = True
+                else:
+                    sta_item.setHidden(True)
+
+            net_item.setHidden(not (net_matches or any_sta_visible))
+            if (net_matches or any_sta_visible) and sta_text:
+                net_item.setExpanded(True)
+
+    def _filter_prop(self, item, prop_text):
+        # Apply property text filter recursively. Show all if empty."""
+        if not prop_text:
+            item.setHidden(False)
+            for i in range(item.childCount()):
+                self._filter_prop(item.child(i), prop_text)
+            return True
+
+        child_match = False
         for i in range(item.childCount()):
-            child_item = item.child(i)
-            if self._recursive_filter(child_item, search_text):
-                child_match_found = True
+            if self._filter_prop(item.child(i), prop_text):
+                child_match = True
 
         item_text = (item.text(0) + item.text(1)).lower()
-        self_match = search_text in item_text
-
-        should_be_visible = self_match or child_match_found
-        item.setHidden(not should_be_visible)
-
-        if should_be_visible and search_text:
+        visible = prop_text in item_text or child_match
+        item.setHidden(not visible)
+        if visible and prop_text:
             item.setExpanded(True)
-
-        return should_be_visible
+        return visible

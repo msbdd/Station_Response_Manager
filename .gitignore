@@ -1,0 +1,8 @@
+Station_Responce_Manager.code-workspace
+resources/NRL
+build
+resources/nrl_response_index.json
+temp.py
+*.pyc
+*.xml
+*.dataless
