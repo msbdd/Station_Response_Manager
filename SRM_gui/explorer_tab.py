@@ -236,7 +236,43 @@ class ExplorerTab(QWidget):
                 item.setFlags(item.flags() | Qt.ItemIsEditable)
                 item.setData(0, Qt.UserRole, (obj, field))
 
+    def _save_tree_state(self):
+        # Save expanded paths and selected item path.
+        # Fixes new item creation
+        expanded = set()
+        selected_path = None
+        sel = self.tree.currentItem()
+
+        def walk(item, path=""):
+            p = f"{path}/{item.text(0)}" if path else item.text(0)
+            if item.isExpanded():
+                expanded.add(p)
+            if item is sel:
+                nonlocal selected_path
+                selected_path = p
+            for i in range(item.childCount()):
+                walk(item.child(i), p)
+
+        for i in range(self.tree.topLevelItemCount()):
+            walk(self.tree.topLevelItem(i))
+        return expanded, selected_path
+
+    def _restore_tree_state(self, expanded, selected_path):
+        """Restore expanded paths and selection."""
+        def walk(item, path=""):
+            p = f"{path}/{item.text(0)}" if path else item.text(0)
+            if p in expanded:
+                item.setExpanded(True)
+            if p == selected_path:
+                self.tree.setCurrentItem(item)
+            for i in range(item.childCount()):
+                walk(item.child(i), p)
+
+        for i in range(self.tree.topLevelItemCount()):
+            walk(self.tree.topLevelItem(i))
+
     def populate_tree(self, inv):
+        expanded, selected_path = self._save_tree_state()
         self.tree.clear()
         self.current_inventory = inv
         try:
@@ -337,7 +373,8 @@ class ExplorerTab(QWidget):
         except Exception as e:
             QTreeWidgetItem(self.tree, ["Error", str(e)])
         self.current_obj = None
-        self.tree.collapseAll()
+        self._restore_tree_state(expanded, selected_path)
+        self.filter_tree()
 
     def on_tree_selection_changed(self):
         item = self.tree.currentItem()
