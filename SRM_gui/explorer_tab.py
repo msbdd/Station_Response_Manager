@@ -62,6 +62,38 @@ class ExplorerTab(QWidget):
         self.info_label = QLabel(f"Loaded file: {filepath}")
         layout.addWidget(self.info_label)
 
+    def navigate_to(self, net_code, sta_code, chan_code):
+        # Find and select/expand a specific network/station/channel."""
+        for ni in range(self.tree.topLevelItemCount()):
+            net_item = self.tree.topLevelItem(ni)
+            if net_item.text(0) != f"Network: {net_code}":
+                continue
+            net_item.setExpanded(True)
+            if not sta_code:
+                self.tree.setCurrentItem(net_item)
+                self.tree.scrollToItem(net_item)
+                return
+            for si in range(net_item.childCount()):
+                sta_item = net_item.child(si)
+                if sta_item.text(0) != f"Station: {sta_code}":
+                    continue
+                sta_item.setExpanded(True)
+                if not chan_code:
+                    self.tree.setCurrentItem(sta_item)
+                    self.tree.scrollToItem(sta_item)
+                    return
+                for ci in range(sta_item.childCount()):
+                    chan_item = sta_item.child(ci)
+                    if chan_item.text(0) == f"Channel: {chan_code}":
+                        chan_item.setExpanded(True)
+                        self.tree.setCurrentItem(chan_item)
+                        self.tree.scrollToItem(chan_item)
+                        return
+                # Channel not found, select station
+                self.tree.setCurrentItem(sta_item)
+                self.tree.scrollToItem(sta_item)
+                return
+
     def create_new_field(self):
         item = self.tree.currentItem()
         if not item:

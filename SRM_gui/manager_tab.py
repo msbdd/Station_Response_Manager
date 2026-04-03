@@ -73,6 +73,9 @@ class ManagerTab(QWidget):
         self.right_tabs.addTab(self.map_view, "Map")
 
         self.timeline_widget = TimelineWidget()
+        self.timeline_widget.item_activated.connect(
+            self.open_from_timeline
+        )
         self.right_tabs.addTab(self.timeline_widget, "Timeline")
         self.right_tabs.currentChanged.connect(
             self.on_right_tab_changed
@@ -440,6 +443,16 @@ class ManagerTab(QWidget):
         self.timeline_widget.update_timeline(
             self.main_window.loaded_files
         )
+
+    def open_from_timeline(self, filepath, net_code, sta_code, chan_code):
+        inventory = self.main_window.loaded_files.get(filepath)
+        if not inventory:
+            return
+        self.main_window.open_explorer_tab(filepath, inventory)
+        key = ("explorer", filepath)
+        explorer = self.main_window.open_tabs.get(key)
+        if explorer:
+            explorer.navigate_to(net_code, sta_code, chan_code)
 
     def refresh_theme(self):
         self.timeline_widget.refresh_theme()

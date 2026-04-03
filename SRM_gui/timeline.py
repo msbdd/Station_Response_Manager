@@ -13,7 +13,7 @@ from PyQt5.QtWidgets import (
     QToolTip,
 )
 from PyQt5.QtGui import QColor, QFont, QBrush, QPen, QTransform
-from PyQt5.QtCore import Qt, QTimer
+from PyQt5.QtCore import Qt, QTimer, pyqtSignal
 from SRM_core.utils import (
     utc_to_ts,
     ts_to_label,
@@ -73,6 +73,14 @@ class TimelineView(QGraphicsView):
         self._x_scale = 1.0
         self._y_scale = 1.0
         self._timeline_widget = None
+
+    def mouseDoubleClickEvent(self, event):
+        if event.button() == Qt.LeftButton and self._timeline_widget:
+            scene_pt = self.mapToScene(event.pos())
+            row_idx = int(scene_pt.y() / self._timeline_widget.ROW_H)
+            self._timeline_widget.activate_row(row_idx)
+        else:
+            super().mouseDoubleClickEvent(event)
 
     def wheelEvent(self, event):
         mods = event.modifiers()
@@ -150,6 +158,8 @@ class TimelineWidget(QWidget):
 
     ROW_H = 22
     LABEL_W = 140
+    # Emitted on double-click: (filepath, net_code, sta_code, chan_code)
+    item_activated = pyqtSignal(str, str, str, str)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -615,6 +625,21 @@ class TimelineWidget(QWidget):
         self._needs_initial_fit = True
         QTimer.singleShot(50, self._initial_fit)
 
+    def activate_row(self, row_idx):
+        if not hasattr(self, '_rows') or row_idx < 0:
+            return
+        if row_idx >= len(self._rows):
+            return
+        row = self._rows[row_idx]
+        # full_id is "NET.STA" for stations, "NET.STA.LOC.CHA" for channels
+        parts = row['full_id'].split('.')
+        net_code = parts[0] if len(parts) >= 1 else ""
+        sta_code = parts[1] if len(parts) >= 2 else ""
+        chan_code = parts[3] if len(parts) >= 4 else ""
+        self.item_activated.emit(
+            row['filepath'], net_code, sta_code, chan_code
+        )
+
     def _apply_filter(self):
         if not hasattr(self, '_all_rows') or not self._all_rows:
             return
@@ -638,12 +663,12 @@ class TimelineWidget(QWidget):
 
     def group_stations(self, loaded_files):
         groups = {}
-        for _fp, inv in loaded_files.items():
+        for fp, inv in loaded_files.items():
             for net in inv.networks:
                 for sta in net.stations:
                     key = f"{net.code}.{sta.code}"
                     groups.setdefault(key, []).append(
-                        (sta, net.code)
+                        (sta, net.code, fp)
                     )
         return groups
 
@@ -662,7 +687,9 @@ class TimelineWidget(QWidget):
             sta_segs = []
             prev_params = None
             seg_idx = 0
-            for sta, net_code in sorted(
+            # Use first entry's filepath for this group
+            sta_filepath = entries[0][2]
+            for sta, net_code, _fp in sorted(
                 entries,
                 key=lambda e: utc_to_ts(
                     e[0].creation_date
@@ -714,11 +741,12 @@ class TimelineWidget(QWidget):
                 'kind': 'station',
                 'group': sta_key,
                 'full_id': sta_key,
+                'filepath': sta_filepath,
             })
 
             # --- channel-level rows ---
             chan_map = {}
-            for sta, _nc in entries:
+            for sta, _nc, _fp in entries:
                 for ch in sta.channels:
                     loc = ch.location_code or "--"
                     k = (loc, ch.code)
@@ -779,6 +807,7 @@ class TimelineWidget(QWidget):
                     'kind': 'channel',
                     'group': sta_key,
                     'full_id': f"{sta_key}.{loc}.{code}",
+                    'filepath': sta_filepath,
                 })
         return rows
 
