@@ -88,6 +88,10 @@ class MainWindow(QMainWindow):
         new_inventory.setShortcut("Ctrl+N")
         new_inventory.triggered.connect(self.create_new_inventory)
         file_menu.addAction(new_inventory)
+        add_files = QAction("Add File(s)", self)
+        add_files.setShortcut("Ctrl+Shift+O")
+        add_files.triggered.connect(self.add_files)
+        file_menu.addAction(add_files)
         add_data = QAction("Add Data", self)
         add_data.setShortcut("Ctrl+O")
         add_data.triggered.connect(self.add_data)
@@ -199,6 +203,25 @@ class MainWindow(QMainWindow):
                         self, "Error", f"Failed to load {file}:\n{e}"
                     )
         self.update_status_bar()
+
+    def add_files(self):
+        filepaths, _ = QFileDialog.getOpenFileNames(
+            self,
+            "Select Station Files",
+            "",
+            "Station/Response Files (*.xml *.dataless *.dless);;"
+            "All Files (*)",
+        )
+        if not filepaths:
+            return
+
+        loaded = 0
+        for filepath in filepaths:
+            if self._load_file(filepath):
+                loaded += 1
+
+        if loaded:
+            self.update_status_bar()
 
     def open_explorer_tab(self, filepath, inventory):
         key = ("explorer", filepath)
