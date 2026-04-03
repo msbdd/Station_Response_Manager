@@ -19,17 +19,13 @@ While the Java version of PDCC still works, I experienced issues:
 
 StationXML is a great format for managing station metadata — but editing it manually in a text editor isn't always comfortable. **Seismic Response Manager** is designed for usability, making common tasks easier, safer, and more convenient.
 
-## Features
+## Documentation
 
-- Load, view, and edit station metadata (StationXML and dataless SEED)
-- Interactive station map with offline support (pre-cached world map tiles)
-- Channel timeline visualization
-- Response file management with the NRL (Nominal Response Library)
-- Cross-platform: Windows (cx_Freeze) and Linux (AppImage)
+- [Quick Start Guide](docs/quick_start.md)
 
 ## Status
 
-Currently working towards a first MVP. Intended for both command-line and graphical interface users.
+Optimized primarily for graphical interface users, this project emphasizes intuitive usability and straightforward design over complex technical requirements. In a nutshell, that’s just a polite way of saying it’s another text editor made specifically for StationXML files. Okay, it also has a miniSEED reader, so maybe it's slightly more than a text editor, but we still keep things simple.
 
 ## Dependencies and attribution
 
