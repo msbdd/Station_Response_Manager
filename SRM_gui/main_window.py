@@ -174,9 +174,9 @@ class MainWindow(QMainWindow):
                     self, "Error", f"Failed to save {filepath}:\n{e}"
                 )
 
-        for (tab_type, tab_id), widget in self.open_tabs.items():
-            if tab_type == "explorer" and isinstance(widget, ExplorerTab):
-                tab_inv = self.loaded_files.get(tab_id)
+        for key, widget in self.open_tabs.items():
+            if key[0] == "explorer" and isinstance(widget, ExplorerTab):
+                tab_inv = self.loaded_files.get(key[1])
                 if tab_inv:
                     widget.populate_tree(tab_inv)
 
@@ -223,19 +223,32 @@ class MainWindow(QMainWindow):
         if loaded:
             self.update_status_bar()
 
-    def open_explorer_tab(self, filepath, inventory):
-        key = ("explorer", filepath)
-        if key not in self.open_tabs:
-            explorer = ExplorerTab(filepath=filepath, main_window=self)
-            explorer.populate_tree(inventory)
-            index = self.tabs.addTab(
-                explorer, f"Explorer - {os.path.basename(filepath)}"
-            )
-            self.open_tabs[key] = explorer
-            self.tabs.setCurrentIndex(index)
-        else:
-            index = self.tabs.indexOf(self.open_tabs[key])
-            self.tabs.setCurrentIndex(index)
+    def open_explorer_tab(self, filepath, inventory, force_new=False):
+        if not force_new:
+            for key, widget in self.open_tabs.items():
+                if (key[0] == "explorer" and key[1] == filepath
+                        and isinstance(widget, ExplorerTab)):
+                    index = self.tabs.indexOf(widget)
+                    self.tabs.setCurrentIndex(index)
+                    return widget
+
+        explorer = ExplorerTab(filepath=filepath, main_window=self)
+        explorer.populate_tree(inventory)
+
+        existing = sum(
+            1 for k in self.open_tabs
+            if k[0] == "explorer" and k[1] == filepath
+        )
+        base_name = os.path.basename(filepath)
+        title = f"Explorer - {base_name}"
+        if existing > 0:
+            title = f"Explorer - {base_name} ({existing + 1})"
+
+        index = self.tabs.addTab(explorer, title)
+        key = ("explorer", filepath, id(explorer))
+        self.open_tabs[key] = explorer
+        self.tabs.setCurrentIndex(index)
+        return explorer
 
     def open_response_tab(self, response_id, response_data, explorer_tab):
         key = ("response", response_id)
@@ -361,8 +374,8 @@ class MainWindow(QMainWindow):
             settings.setValue("theme", "dark")
         if hasattr(self, 'manager_tab'):
             self.manager_tab.refresh_theme()
-        for (tab_type, _), widget in self.open_tabs.items():
-            if tab_type == "response" and isinstance(widget, ResponseTab):
+        for key, widget in self.open_tabs.items():
+            if key[0] == "response" and isinstance(widget, ResponseTab):
                 widget.apply_theme()
                 widget.plot_response(widget.selected_response)
         self.update_status_bar()

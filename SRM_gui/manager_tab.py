@@ -60,6 +60,10 @@ class ManagerTab(QWidget):
         delete_btn.clicked.connect(self.delete_selected_item)
         btn_layout.addWidget(delete_btn)
 
+        new_view_btn = QPushButton("New View")
+        new_view_btn.clicked.connect(self.new_explorer_view)
+        btn_layout.addWidget(new_view_btn)
+
         left_layout.addLayout(btn_layout)
         splitter.addWidget(left_widget)
         self.right_tabs = QTabWidget()
@@ -223,6 +227,33 @@ class ManagerTab(QWidget):
                     tooltip += f"  ... and {remaining} more"
                 dl_item.setToolTip(0, tooltip)
             chan_item.addChild(dl_item)
+
+    def new_explorer_view(self):
+        item = self.file_tree.currentItem()
+        if not item:
+            QMessageBox.warning(
+                self, "No Selection",
+                "Select a file (or any item under it) to open a new view."
+            )
+            return
+        file_item = item
+        while file_item is not None:
+            data = file_item.data(0, Qt.UserRole)
+            if data and data[0] == "file":
+                break
+            file_item = file_item.parent()
+        if file_item is None:
+            QMessageBox.warning(
+                self, "Invalid Selection",
+                "Selected item is not under a loaded file."
+            )
+            return
+        filepath = file_item.data(0, Qt.UserRole)[1]
+        inventory = self.main_window.loaded_files.get(filepath)
+        if inventory:
+            self.main_window.open_explorer_tab(
+                filepath=filepath, inventory=inventory, force_new=True
+            )
 
     def handle_item_double_click(self, item, column):
         data = item.data(0, Qt.UserRole)
@@ -448,9 +479,9 @@ class ManagerTab(QWidget):
         inventory = self.main_window.loaded_files.get(filepath)
         if not inventory:
             return
-        self.main_window.open_explorer_tab(filepath, inventory)
-        key = ("explorer", filepath)
-        explorer = self.main_window.open_tabs.get(key)
+        explorer = self.main_window.open_explorer_tab(
+            filepath, inventory, force_new=True
+        )
         if explorer:
             explorer.navigate_to(net_code, sta_code, chan_code)
 
