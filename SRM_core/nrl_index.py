@@ -2,7 +2,7 @@ import os
 import json
 import hashlib
 import configparser
-from math import log10, floor
+from math import log10, floor, isfinite
 from typing import Optional, Tuple, Dict, List
 from dataclasses import dataclass, asdict
 from obspy import read_inventory
@@ -13,7 +13,7 @@ HASH_SIG_FIGS = 5
 
 def round_to_sig_figs(x: float, sig: int = HASH_SIG_FIGS) -> float:
 
-    if x == 0:
+    if x == 0 or not isfinite(x):
         return 0.0
     return round(x, sig - int(floor(log10(abs(x)))) - 1)
 
@@ -818,7 +818,7 @@ class NRLIndex:
         for i in range(min(3, n)):
             cv = round_to_sig_figs(float(coeffs[i]))
             hasher.update(f":c{i}={cv}".encode())
-        for i in range(max(0, n - 3), n):
+        for i in range(max(3, n - 3), n):
             cv = round_to_sig_figs(float(coeffs[i]))
             hasher.update(f":c{i}={cv}".encode())
         coeff_sum = sum(float(c) for c in coeffs)

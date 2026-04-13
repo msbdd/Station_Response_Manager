@@ -166,10 +166,12 @@ class MainWindow(QMainWindow):
 
     def save_all_files(self):
 
+        failed = False
         for filepath, inv in self.loaded_files.items():
             try:
                 inv.write(filepath, format="STATIONXML")
             except Exception as e:
+                failed = True
                 QMessageBox.warning(
                     self, "Error", f"Failed to save {filepath}:\n{e}"
                 )
@@ -181,9 +183,10 @@ class MainWindow(QMainWindow):
                     widget.populate_tree(tab_inv)
 
         self.manager_tab.refresh()
-        QMessageBox.information(
-            self, "Save Complete", "All inventories saved successfully."
-        )
+        if not failed:
+            QMessageBox.information(
+                self, "Save Complete", "All inventories saved successfully."
+            )
 
     def add_data(self):
         folder = QFileDialog.getExistingDirectory(self, "Select Data Folder")

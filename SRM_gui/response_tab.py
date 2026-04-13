@@ -389,6 +389,8 @@ class ResponseTab(QWidget):
             font.setBold(True)
             item.setFont(1, font)
 
+            self.plot_response(self.selected_response)
+
         except Exception as e:
             QMessageBox.warning(
                 self, "Edit Error", f"Failed to update {attr}: {e}"
