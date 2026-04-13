@@ -475,7 +475,10 @@ class ManagerTab(QWidget):
             self.main_window.loaded_files
         )
 
-    def open_from_timeline(self, filepath, net_code, sta_code, chan_code):
+    def open_from_timeline(
+        self, filepath, net_code, sta_code, chan_code,
+        loc_code="", start_ts=0.0,
+    ):
         inventory = self.main_window.loaded_files.get(filepath)
         if not inventory:
             return
@@ -483,7 +486,10 @@ class ManagerTab(QWidget):
             filepath, inventory, force_new=True
         )
         if explorer:
-            explorer.navigate_to(net_code, sta_code, chan_code)
+            explorer.navigate_to(
+                net_code, sta_code, chan_code,
+                loc_code=loc_code, start_ts=start_ts,
+            )
 
     def refresh_theme(self):
         self.timeline_widget.refresh_theme()

@@ -78,7 +78,7 @@ class TimelineView(QGraphicsView):
         if event.button() == Qt.LeftButton and self._timeline_widget:
             scene_pt = self.mapToScene(event.pos())
             row_idx = int(scene_pt.y() / self._timeline_widget.ROW_H)
-            self._timeline_widget.activate_row(row_idx)
+            self._timeline_widget.activate_row(row_idx, scene_pt.x())
         else:
             super().mouseDoubleClickEvent(event)
 
@@ -158,8 +158,8 @@ class TimelineWidget(QWidget):
 
     ROW_H = 22
     LABEL_W = 140
-    # Emitted on double-click: (filepath, net_code, sta_code, chan_code)
-    item_activated = pyqtSignal(str, str, str, str)
+    # Emitted on double-click: (filepath, net, sta, chan, loc, start_ts)
+    item_activated = pyqtSignal(str, str, str, str, str, float)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -625,7 +625,7 @@ class TimelineWidget(QWidget):
         self._needs_initial_fit = True
         QTimer.singleShot(50, self._initial_fit)
 
-    def activate_row(self, row_idx):
+    def activate_row(self, row_idx, scene_x=0):
         if not hasattr(self, '_rows') or row_idx < 0:
             return
         if row_idx >= len(self._rows):
@@ -635,9 +635,32 @@ class TimelineWidget(QWidget):
         parts = row['full_id'].split('.')
         net_code = parts[0] if len(parts) >= 1 else ""
         sta_code = parts[1] if len(parts) >= 2 else ""
+        loc_code = parts[2] if len(parts) >= 3 else ""
         chan_code = parts[3] if len(parts) >= 4 else ""
+
+        # Determine which segment (epoch) was clicked via x position
+        start_ts = 0.0
+        pps = getattr(self, '_pps', 0)
+        t_min = getattr(self, '_t_min', 0)
+        if pps > 0 and row.get('segments'):
+            click_t = t_min + scene_x / pps
+            for seg in row['segments']:
+                if seg['start'] <= click_t <= seg['end']:
+                    start_ts = seg['start']
+                    break
+            else:
+                # No exact hit — pick the nearest segment
+                start_ts = min(
+                    row['segments'],
+                    key=lambda s: min(
+                        abs(s['start'] - click_t),
+                        abs(s['end'] - click_t),
+                    ),
+                )['start']
+
         self.item_activated.emit(
-            row['filepath'], net_code, sta_code, chan_code
+            row['filepath'], net_code, sta_code, chan_code,
+            loc_code, start_ts,
         )
 
     def _apply_filter(self):

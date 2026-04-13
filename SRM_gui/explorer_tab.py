@@ -66,8 +66,13 @@ class ExplorerTab(QWidget):
         self.info_label = QLabel(f"Loaded file: {filepath}")
         layout.addWidget(self.info_label)
 
-    def navigate_to(self, net_code, sta_code, chan_code):
-        # Find and select/expand a specific network/station/channel."""
+    def navigate_to(
+        self, net_code, sta_code, chan_code,
+        loc_code="", start_ts=0.0,
+    ):
+        # Find and select/expand a specific network/station/channel.
+        from SRM_core.utils import utc_to_ts
+
         for ni in range(self.tree.topLevelItemCount()):
             net_item = self.tree.topLevelItem(ni)
             if net_item.text(0) != f"Network: {net_code}":
@@ -86,13 +91,50 @@ class ExplorerTab(QWidget):
                     self.tree.setCurrentItem(sta_item)
                     self.tree.scrollToItem(sta_item)
                     return
+
+                # Collect all matching channel items, then pick best
+                best_item = None
+                best_diff = None
+                sta_ref = sta_item.data(0, Qt.UserRole)
+                channels = (
+                    sta_ref[1].channels
+                    if sta_ref and sta_ref[0] == "station"
+                    else []
+                )
+                chan_idx = 0
                 for ci in range(sta_item.childCount()):
                     chan_item = sta_item.child(ci)
-                    if chan_item.text(0) == f"Channel: {chan_code}":
-                        chan_item.setExpanded(True)
-                        self.tree.setCurrentItem(chan_item)
-                        self.tree.scrollToItem(chan_item)
-                        return
+                    label = chan_item.text(0)
+                    if not label.startswith("Channel: "):
+                        continue
+                    if label != f"Channel: {chan_code}":
+                        chan_idx += 1
+                        continue
+
+                    # Code matches — check loc and start_date
+                    if chan_idx < len(channels):
+                        ch = channels[chan_idx]
+                        if loc_code and (ch.location_code or "") != loc_code.replace("--", ""):
+                            chan_idx += 1
+                            continue
+                        if start_ts and ch.start_date:
+                            ts = utc_to_ts(ch.start_date) or 0
+                            diff = abs(ts - start_ts)
+                            if best_diff is None or diff < best_diff:
+                                best_diff = diff
+                                best_item = chan_item
+                        elif best_item is None:
+                            best_item = chan_item
+                    elif best_item is None:
+                        best_item = chan_item
+                    chan_idx += 1
+
+                if best_item:
+                    best_item.setExpanded(True)
+                    self.tree.setCurrentItem(best_item)
+                    self.tree.scrollToItem(best_item)
+                    return
+
                 # Channel not found, select station
                 self.tree.setCurrentItem(sta_item)
                 self.tree.scrollToItem(sta_item)
