@@ -192,12 +192,20 @@ class ResponseTab(QWidget):
         self.canvas.draw()
 
     def revert_response(self):
-        self.response = deepcopy(self.original_response)
+        self.response.response_stages = deepcopy(
+            self.original_response.response_stages
+        )
+        self.response.instrument_sensitivity = deepcopy(
+            self.original_response.instrument_sensitivity
+        )
         self.load_response_editor(self.response)
         QMessageBox.information(
             self, "Reverted",
             "All changes in this tab have been reverted."
             )
+
+    def commit_baseline(self):
+        self.original_response = deepcopy(self.selected_response)
 
     def populate_stage_tree(self, response):
         self.stage_tree.clear()
@@ -614,6 +622,7 @@ class ResponseTab(QWidget):
 
             if new_stage:
                 self.selected_response.response_stages.append(new_stage)
+                self._renumber_stages()
                 self.load_response_editor(self.selected_response)
                 return
 

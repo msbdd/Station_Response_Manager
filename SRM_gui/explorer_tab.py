@@ -114,7 +114,9 @@ class ExplorerTab(QWidget):
                     # Code matches — check loc and start_date
                     if chan_idx < len(channels):
                         ch = channels[chan_idx]
-                        if loc_code and (ch.location_code or "") != loc_code.replace("--", ""):
+                        normalized_loc = loc_code.replace("--", "")
+                        cur_loc = ch.location_code or ""
+                        if loc_code and cur_loc != normalized_loc:
                             chan_idx += 1
                             continue
                         if start_ts and ch.start_date:

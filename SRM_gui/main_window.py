@@ -166,12 +166,12 @@ class MainWindow(QMainWindow):
 
     def save_all_files(self):
 
-        failed = False
+        failed_paths = set()
         for filepath, inv in self.loaded_files.items():
             try:
                 inv.write(filepath, format="STATIONXML")
             except Exception as e:
-                failed = True
+                failed_paths.add(filepath)
                 QMessageBox.warning(
                     self, "Error", f"Failed to save {filepath}:\n{e}"
                 )
@@ -181,9 +181,13 @@ class MainWindow(QMainWindow):
                 tab_inv = self.loaded_files.get(key[1])
                 if tab_inv:
                     widget.populate_tree(tab_inv)
+            elif key[0] == "response" and isinstance(widget, ResponseTab):
+                tab_path = getattr(widget.explorer_tab, "filepath", None)
+                if tab_path and tab_path not in failed_paths:
+                    widget.commit_baseline()
 
         self.manager_tab.refresh()
-        if not failed:
+        if not failed_paths:
             QMessageBox.information(
                 self, "Save Complete", "All inventories saved successfully."
             )
