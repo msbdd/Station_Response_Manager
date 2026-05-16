@@ -82,65 +82,63 @@ class ExplorerTab(QWidget):
                 self.tree.setCurrentItem(net_item)
                 self.tree.scrollToItem(net_item)
                 return
-            for si in range(net_item.childCount()):
-                sta_item = net_item.child(si)
-                if sta_item.text(0) != f"Station: {sta_code}":
-                    continue
-                sta_item.setExpanded(True)
-                if not chan_code:
-                    self.tree.setCurrentItem(sta_item)
-                    self.tree.scrollToItem(sta_item)
-                    return
 
-                # Collect all matching channel items, then pick best
-                best_item = None
-                best_diff = None
-                sta_ref = sta_item.data(0, Qt.UserRole)
-                channels = (
-                    sta_ref[1].channels
-                    if sta_ref and sta_ref[0] == "station"
-                    else []
-                )
-                chan_idx = 0
+            # A station code may appear multiple times under the same
+            # network when StationXML has separate <Station> blocks for
+            # different operational periods. Search across all of them.
+            sta_items = [
+                net_item.child(si)
+                for si in range(net_item.childCount())
+                if net_item.child(si).text(0) == f"Station: {sta_code}"
+            ]
+            if not sta_items:
+                return
+
+            for s in sta_items:
+                s.setExpanded(True)
+
+            if not chan_code:
+                self.tree.setCurrentItem(sta_items[0])
+                self.tree.scrollToItem(sta_items[0])
+                return
+
+            best_item = None
+            best_diff = None
+            for sta_item in sta_items:
                 for ci in range(sta_item.childCount()):
                     chan_item = sta_item.child(ci)
-                    label = chan_item.text(0)
-                    if not label.startswith("Channel: "):
+                    ref = chan_item.data(0, Qt.UserRole)
+                    if not (
+                        ref and isinstance(ref, tuple)
+                        and ref[0] == "channel"
+                    ):
                         continue
-                    if label != f"Channel: {chan_code}":
-                        chan_idx += 1
+                    ch = ref[1]
+                    if ch.code != chan_code:
                         continue
-
-                    # Code matches — check loc and start_date
-                    if chan_idx < len(channels):
-                        ch = channels[chan_idx]
-                        normalized_loc = loc_code.replace("--", "")
-                        cur_loc = ch.location_code or ""
-                        if loc_code and cur_loc != normalized_loc:
-                            chan_idx += 1
-                            continue
-                        if start_ts and ch.start_date:
-                            ts = utc_to_ts(ch.start_date) or 0
-                            diff = abs(ts - start_ts)
-                            if best_diff is None or diff < best_diff:
-                                best_diff = diff
-                                best_item = chan_item
-                        elif best_item is None:
+                    # Match timeline.py's "--" sentinel for empty loc.
+                    cur_loc = ch.location_code or "--"
+                    if loc_code and cur_loc != loc_code:
+                        continue
+                    if start_ts and ch.start_date:
+                        ts = utc_to_ts(ch.start_date) or 0
+                        diff = abs(ts - start_ts)
+                        if best_diff is None or diff < best_diff:
+                            best_diff = diff
                             best_item = chan_item
                     elif best_item is None:
                         best_item = chan_item
-                    chan_idx += 1
 
-                if best_item:
-                    best_item.setExpanded(True)
-                    self.tree.setCurrentItem(best_item)
-                    self.tree.scrollToItem(best_item)
-                    return
-
-                # Channel not found, select station
-                self.tree.setCurrentItem(sta_item)
-                self.tree.scrollToItem(sta_item)
+            if best_item:
+                best_item.setExpanded(True)
+                self.tree.setCurrentItem(best_item)
+                self.tree.scrollToItem(best_item)
                 return
+
+            # Channel not found in any matching station — fall back.
+            self.tree.setCurrentItem(sta_items[0])
+            self.tree.scrollToItem(sta_items[0])
+            return
 
     # Editable fields per type — from ObsPy's actual attributes
     # This needs to be changed if moved to a different ObsPy version...
@@ -372,6 +370,9 @@ class ExplorerTab(QWidget):
                     for chan in sta.channels:
                         chan_item = QTreeWidgetItem(
                             [f"Channel: {chan.code}", ""]
+                        )
+                        chan_item.setData(
+                            0, Qt.UserRole, ("channel", chan)
                         )
                         sta_item.addChild(chan_item)
                         self.add_object_fields(chan_item, chan)
