@@ -178,9 +178,11 @@ class MainWindow(QMainWindow):
 
         for key, widget in self.open_tabs.items():
             if key[0] == "explorer" and isinstance(widget, ExplorerTab):
-                tab_inv = self.loaded_files.get(key[1])
-                if tab_inv:
-                    widget.populate_tree(tab_inv)
+                if key[1] in failed_paths:
+                    continue
+                widget.undo_stack.clear()
+                widget._baseline_snapshot = {}
+                widget.populate_tree(widget.current_inventory)
             elif key[0] == "response" and isinstance(widget, ResponseTab):
                 tab_path = getattr(widget.explorer_tab, "filepath", None)
                 if tab_path and tab_path not in failed_paths:
@@ -240,6 +242,7 @@ class MainWindow(QMainWindow):
                     return widget
 
         explorer = ExplorerTab(filepath=filepath, main_window=self)
+        explorer.current_inventory = inventory
         explorer.populate_tree(inventory)
 
         existing = sum(
@@ -274,11 +277,44 @@ class MainWindow(QMainWindow):
         if index == 0:
             return
         widget = self.tabs.widget(index)
+        inventory_touched = False
+
+        if isinstance(widget, ExplorerTab):
+            child_responses = [
+                (k, t) for k, t in self.open_tabs.items()
+                if (k[0] == "response" and isinstance(t, ResponseTab)
+                    and t.explorer_tab is widget)
+            ]
+            for k, rtab in child_responses:
+                if rtab.undo_stack:
+                    rtab._revert_all()
+                    inventory_touched = True
+                ridx = self.tabs.indexOf(rtab)
+                if ridx != -1:
+                    self.tabs.removeTab(ridx)
+                del self.open_tabs[k]
+
+            if widget.undo_stack:
+                widget._revert_all()
+                inventory_touched = True
+        elif isinstance(widget, ResponseTab):
+            if widget.undo_stack:
+                widget._revert_all()
+                inventory_touched = True
+
         for key, tab in list(self.open_tabs.items()):
             if tab == widget:
                 del self.open_tabs[key]
                 break
         self.tabs.removeTab(index)
+
+        if inventory_touched:
+            self.manager_tab.refresh()
+            for k, t in self.open_tabs.items():
+                if (k[0] == "explorer" and isinstance(t, ExplorerTab)
+                        and t.current_inventory is not None):
+                    t._baseline_snapshot = {}
+                    t.populate_tree(t.current_inventory)
 
     def create_new_inventory(self):
         filepath, _ = QFileDialog.getSaveFileName(

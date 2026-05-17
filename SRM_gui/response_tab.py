@@ -18,9 +18,10 @@ from PyQt5.QtWidgets import (
     QHBoxLayout,
     QFormLayout,
     QFileDialog,
+    QShortcut,
 )
 from copy import deepcopy
-from PyQt5.QtGui import QColor, QBrush
+from PyQt5.QtGui import QColor, QBrush, QKeySequence
 from PyQt5.QtCore import Qt, QTimer
 from SRM_core.utils import (
     combine_resp,
@@ -47,6 +48,9 @@ from obspy.core.inventory.response import (
     ResponseListElement,
 )
 from obspy.clients.nrl import NRL
+
+
+_BASELINE_ROLE = Qt.UserRole + 1
 
 
 class MplCanvas(FigureCanvas):
@@ -84,8 +88,16 @@ class ResponseTab(QWidget):
         self.main_window = main_window
         self.explorer_tab = explorer_tab
         self.nrl_root = nrl_root
+        self.undo_stack = []
+        self._suppress_edits = False
+        self._field_index = {}
+        self._pz_index = {}
         self.response_layout = QVBoxLayout(self)
         self.load_response_editor(self.response)
+
+        self.undo_shortcut = QShortcut(QKeySequence.Undo, self)
+        self.undo_shortcut.setContext(Qt.WidgetWithChildrenShortcut)
+        self.undo_shortcut.activated.connect(self.undo)
 
     def load_response_editor(self, response):
         self.selected_response = response
@@ -192,6 +204,12 @@ class ResponseTab(QWidget):
         self.canvas.draw()
 
     def revert_response(self):
+        self._push_undo((
+            "bulk_replace",
+            self.response,
+            copy.deepcopy(self.response.response_stages),
+            copy.deepcopy(self.response.instrument_sensitivity),
+        ))
         self.response.response_stages = deepcopy(
             self.original_response.response_stages
         )
@@ -206,9 +224,41 @@ class ResponseTab(QWidget):
 
     def commit_baseline(self):
         self.original_response = deepcopy(self.selected_response)
+        self.undo_stack.clear()
+
+    def _apply_modified_style(self, item, modified):
+        font = item.font(1)
+        font.setBold(modified)
+        item.setFont(1, font)
+        if modified:
+            item.setForeground(1, QBrush(QColor("royalblue")))
+        else:
+            item.setForeground(1, QBrush())
+
+    def _set_editable_item(self, parent, label, value, ref, baseline_value):
+        item = QTreeWidgetItem(parent, [label, str(value)])
+        item.setFlags(item.flags() | Qt.ItemIsEditable)
+        item.setData(0, Qt.UserRole, ref)
+        item.setData(0, _BASELINE_ROLE, baseline_value)
+        modified = self._values_differ(value, baseline_value)
+        self._apply_modified_style(item, modified)
+        if isinstance(ref, tuple) and len(ref) == 2:
+            ref_object, attr = ref
+            self._field_index[(id(ref_object), attr)] = item
+        return item
+
+    @staticmethod
+    def _values_differ(current, baseline):
+        try:
+            return current != baseline
+        except Exception:
+            return True
 
     def populate_stage_tree(self, response):
+        self._suppress_edits = True
         self.stage_tree.clear()
+        self._field_index = {}
+        self._pz_index = {}
         nrl_index = self.main_window.nrl_index
         detection = nrl_index.detect_instrument(response)
         if detection.found_any:
@@ -289,64 +339,100 @@ class ResponseTab(QWidget):
                     dl_item.setToolTip(0, tooltip)
                     dl_item.setToolTip(1, tooltip)
 
+        baseline_sens = (
+            self.original_response.instrument_sensitivity
+            if self.original_response is not None
+            else None
+        )
+        baseline_stages = (
+            self.original_response.response_stages
+            if self.original_response is not None
+            else []
+        )
+
         if response.instrument_sensitivity:
             sens = response.instrument_sensitivity
             sens_item = QTreeWidgetItem(
                 self.stage_tree, ["Instrument Sensitivity", ""]
             )
-
-            val_item = QTreeWidgetItem(sens_item, ["Value", str(sens.value)])
-            val_item.setFlags(val_item.flags() | Qt.ItemIsEditable)
-            val_item.setData(0, Qt.UserRole, (sens, "value"))
-
-            freq_item = QTreeWidgetItem(
-                sens_item, ["Frequency", str(sens.frequency)]
+            base_val = (
+                getattr(baseline_sens, "value", None)
+                if baseline_sens is not None
+                else None
             )
-            freq_item.setFlags(freq_item.flags() | Qt.ItemIsEditable)
-            freq_item.setData(0, Qt.UserRole, (sens, "frequency"))
+            base_freq = (
+                getattr(baseline_sens, "frequency", None)
+                if baseline_sens is not None
+                else None
+            )
+            self._set_editable_item(
+                sens_item, "Value", sens.value,
+                (sens, "value"), base_val,
+            )
+            self._set_editable_item(
+                sens_item, "Frequency", sens.frequency,
+                (sens, "frequency"), base_freq,
+            )
 
         for i, stage in enumerate(response.response_stages):
+            baseline_stage = (
+                baseline_stages[i] if i < len(baseline_stages) else None
+            )
             stage_item = QTreeWidgetItem(
                 self.stage_tree, [f"Stage {i+1}: {type(stage).__name__}", ""]
             )
             stage_item.setData(0, Qt.UserRole, ("stage", i))
             if hasattr(stage, "stage_gain"):
-                item = QTreeWidgetItem(
-                    stage_item, ["Stage Gain", str(stage.stage_gain)]
+                base_gain = getattr(baseline_stage, "stage_gain", None)
+                self._set_editable_item(
+                    stage_item, "Stage Gain", stage.stage_gain,
+                    (stage, "stage_gain"), base_gain,
                 )
-                item.setFlags(item.flags() | Qt.ItemIsEditable)
-                item.setData(0, Qt.UserRole, (stage, "stage_gain"))
             if hasattr(stage, "normalization_frequency"):
-                item = QTreeWidgetItem(
-                    stage_item,
-                    [
-                        "Normalization Freq",
-                        str(stage.normalization_frequency),
-                    ],
+                base_nf = getattr(
+                    baseline_stage, "normalization_frequency", None
                 )
-                item.setFlags(item.flags() | Qt.ItemIsEditable)
-                item.setData(
-                    0, Qt.UserRole, (stage, "normalization_frequency")
+                self._set_editable_item(
+                    stage_item, "Normalization Freq",
+                    stage.normalization_frequency,
+                    (stage, "normalization_frequency"), base_nf,
                 )
 
             if hasattr(stage, "poles"):
                 poles_item = QTreeWidgetItem(stage_item, ["Poles", ""])
+                baseline_poles = getattr(baseline_stage, "poles", []) or []
                 for j, pole in enumerate(stage.poles):
                     pole_item = QTreeWidgetItem(
                         poles_item,
                         [f"Pole {j}", f"{pole.real} + {pole.imag}j"],
                     )
-
                     pole_item.setData(0, Qt.UserRole, ("pole", stage, j))
+                    base_pole = (
+                        baseline_poles[j] if j < len(baseline_poles) else None
+                    )
+                    pole_item.setData(0, _BASELINE_ROLE, base_pole)
+                    self._apply_modified_style(
+                        pole_item, self._values_differ(pole, base_pole)
+                    )
+                    self._pz_index[(id(stage), "pole", j)] = pole_item
 
             if hasattr(stage, "zeros"):
                 zeros_item = QTreeWidgetItem(stage_item, ["Zeros", ""])
+                baseline_zeros = getattr(baseline_stage, "zeros", []) or []
                 for j, zero in enumerate(stage.zeros):
                     zero_item = QTreeWidgetItem(
                         zeros_item,
                         [f"Zero {j}", f"{zero.real} + {zero.imag}j"],
                     )
                     zero_item.setData(0, Qt.UserRole, ("zero", stage, j))
+                    base_zero = (
+                        baseline_zeros[j] if j < len(baseline_zeros) else None
+                    )
+                    zero_item.setData(0, _BASELINE_ROLE, base_zero)
+                    self._apply_modified_style(
+                        zero_item, self._values_differ(zero, base_zero)
+                    )
+                    self._pz_index[(id(stage), "zero", j)] = zero_item
 
         issues = validate_response(response)
         if issues:
@@ -366,9 +452,10 @@ class ResponseTab(QWidget):
                 color = "#c62828" if severity == "error" else "#e65100"
                 issue_child.setForeground(0, QBrush(QColor(color)))
                 issue_child.setForeground(1, QBrush(QColor(color)))
+        self._suppress_edits = False
 
     def handle_response_edit(self, item, column):
-        if column != 1:
+        if column != 1 or self._suppress_edits:
             return
 
         ref = item.data(0, Qt.UserRole)
@@ -390,12 +477,17 @@ class ResponseTab(QWidget):
             else:
                 new_value = new_text
 
+            self._push_undo(("edit", ref_object, attr, old_value))
             setattr(ref_object, attr, new_value)
 
-            item.setForeground(1, QBrush(QColor("blue")))
-            font = item.font(1)
-            font.setBold(True)
-            item.setFont(1, font)
+            baseline_value = item.data(0, _BASELINE_ROLE)
+            self._suppress_edits = True
+            try:
+                self._apply_modified_style(
+                    item, self._values_differ(new_value, baseline_value)
+                )
+            finally:
+                self._suppress_edits = False
 
             self.plot_response(self.selected_response)
 
@@ -403,7 +495,9 @@ class ResponseTab(QWidget):
             QMessageBox.warning(
                 self, "Edit Error", f"Failed to update {attr}: {e}"
             )
+            self._suppress_edits = True
             item.setText(1, str(old_value))
+            self._suppress_edits = False
 
     def edit_complex_value(self, item, column):
         if column != 1:
@@ -449,16 +543,27 @@ class ResponseTab(QWidget):
                 real = float(real_edit.text())
                 imag = float(imag_edit.text())
                 new_val = complex(real, imag)
+                old_val = value
                 if ref_type == "pole":
+                    self._push_undo(
+                        ("edit_pole", stage, index, old_val)
+                    )
                     stage.poles[index] = new_val
                 else:
+                    self._push_undo(
+                        ("edit_zero", stage, index, old_val)
+                    )
                     stage.zeros[index] = new_val
 
-                item.setText(1, f"{new_val.real} + {new_val.imag}j")
-                item.setForeground(1, QBrush(QColor("blue")))
-                font = item.font(1)
-                font.setBold(True)
-                item.setFont(1, font)
+                self._suppress_edits = True
+                try:
+                    item.setText(1, f"{new_val.real} + {new_val.imag}j")
+                    baseline_value = item.data(0, _BASELINE_ROLE)
+                    self._apply_modified_style(
+                        item, self._values_differ(new_val, baseline_value)
+                    )
+                finally:
+                    self._suppress_edits = False
 
                 self.plot_response(self.selected_response)
 
@@ -532,6 +637,12 @@ class ResponseTab(QWidget):
             and hasattr(self, "selected_response")
             and self.selected_response
         ):
+            self._push_undo((
+                "bulk_replace",
+                self.selected_response,
+                copy.deepcopy(self.selected_response.response_stages),
+                copy.deepcopy(self.selected_response.instrument_sensitivity),
+            ))
             self.selected_response.response_stages = copy.deepcopy(
                 new_resp.response_stages
             )
@@ -563,12 +674,14 @@ class ResponseTab(QWidget):
             if ref_type == "zero":
                 stage = ref[1]
                 stage.zeros.append(complex(0.0, 0.0))
+                self._push_undo(("add_zero", stage))
                 self.load_response_editor(self.selected_response)
                 return
 
             elif ref_type == "pole":
                 stage = ref[1]
                 stage.poles.append(complex(0.0, 0.0))
+                self._push_undo(("add_pole", stage))
                 self.load_response_editor(self.selected_response)
                 return
 
@@ -623,6 +736,9 @@ class ResponseTab(QWidget):
             if new_stage:
                 self.selected_response.response_stages.append(new_stage)
                 self._renumber_stages()
+                self._push_undo(
+                    ("add_stage", self.selected_response, new_stage)
+                )
                 self.load_response_editor(self.selected_response)
                 return
 
@@ -886,26 +1002,43 @@ class ResponseTab(QWidget):
                 if 0 <= stage_idx < len(
                     self.selected_response.response_stages
                 ):
+                    removed = self.selected_response.response_stages[stage_idx]
                     del self.selected_response.response_stages[stage_idx]
                     self._renumber_stages()
+                    self._push_undo(
+                        ("delete_stage", self.selected_response,
+                         removed, stage_idx)
+                    )
                     self.load_response_editor(self.selected_response)
                     return
 
             elif len(ref) == 3:
                 ref_type, stage, index = ref
                 if ref_type == "pole":
+                    removed = stage.poles[index]
                     del stage.poles[index]
+                    self._push_undo(
+                        ("delete_pole", stage, index, removed)
+                    )
                     self.load_response_editor(self.selected_response)
                     return
                 elif ref_type == "zero":
+                    removed = stage.zeros[index]
                     del stage.zeros[index]
+                    self._push_undo(
+                        ("delete_zero", stage, index, removed)
+                    )
                     self.load_response_editor(self.selected_response)
                     return
 
             elif len(ref) == 2:
                 ref_object, attr = ref
                 try:
+                    old_value = getattr(ref_object, attr, None)
                     setattr(ref_object, attr, None)
+                    self._push_undo(
+                        ("delete_field", ref_object, attr, old_value)
+                    )
                     self.load_response_editor(self.selected_response)
                     return
                 except Exception as e:
@@ -913,6 +1046,127 @@ class ResponseTab(QWidget):
                         self, "Error", f"Could not delete attribute: {e}"
                     )
                     return
+
+    _UNDO_LIMIT = 100
+
+    def _push_undo(self, op):
+        self.undo_stack.append(op)
+        if len(self.undo_stack) > self._UNDO_LIMIT:
+            self.undo_stack = self.undo_stack[-self._UNDO_LIMIT:]
+
+    def _apply_reverse(self, op):
+        tag = op[0]
+        if tag == "edit":
+            _, ref_object, attr, old_value = op
+            setattr(ref_object, attr, old_value)
+            return ("field", ref_object, attr, old_value)
+        if tag == "edit_pole":
+            _, stage, index, old_val = op
+            stage.poles[index] = old_val
+            return ("pz", stage, "pole", index, old_val)
+        if tag == "edit_zero":
+            _, stage, index, old_val = op
+            stage.zeros[index] = old_val
+            return ("pz", stage, "zero", index, old_val)
+        if tag == "add_pole":
+            _, stage = op
+            if stage.poles:
+                stage.poles.pop()
+            return ("structural",)
+        if tag == "add_zero":
+            _, stage = op
+            if stage.zeros:
+                stage.zeros.pop()
+            return ("structural",)
+        if tag == "add_stage":
+            _, response, stage = op
+            if stage in response.response_stages:
+                response.response_stages.remove(stage)
+                self._renumber_stages()
+            return ("structural",)
+        if tag == "delete_pole":
+            _, stage, index, removed = op
+            stage.poles.insert(index, removed)
+            return ("structural",)
+        if tag == "delete_zero":
+            _, stage, index, removed = op
+            stage.zeros.insert(index, removed)
+            return ("structural",)
+        if tag == "delete_stage":
+            _, response, removed, index = op
+            response.response_stages.insert(index, removed)
+            self._renumber_stages()
+            return ("structural",)
+        if tag == "delete_field":
+            _, ref_object, attr, old_value = op
+            setattr(ref_object, attr, old_value)
+            return ("field", ref_object, attr, old_value)
+        if tag == "bulk_replace":
+            _, response, stages_snapshot, sens_snapshot = op
+            response.response_stages = stages_snapshot
+            response.instrument_sensitivity = sens_snapshot
+            return ("structural",)
+        return ("structural",)
+
+    def undo(self):
+        if not self.undo_stack:
+            return
+        op = self.undo_stack.pop()
+        fast = False
+        try:
+            result = self._apply_reverse(op)
+            if result[0] == "field":
+                _, ref_object, attr, value = result
+                fast = self._fast_update_field(ref_object, attr, value)
+            elif result[0] == "pz":
+                _, stage, kind, index, value = result
+                fast = self._fast_update_pz(stage, kind, index, value)
+        except Exception as e:
+            QMessageBox.warning(
+                self, "Undo Error", f"Failed to undo: {e}"
+            )
+        if fast:
+            self.plot_response(self.selected_response)
+        else:
+            self.load_response_editor(self.selected_response)
+
+    def _revert_all(self):
+        while self.undo_stack:
+            op = self.undo_stack.pop()
+            try:
+                self._apply_reverse(op)
+            except Exception:
+                pass
+
+    def _fast_update_field(self, ref_object, attr, value):
+        item = self._field_index.get((id(ref_object), attr))
+        if item is None:
+            return False
+        self._suppress_edits = True
+        try:
+            item.setText(1, str(value) if value is not None else "")
+            baseline_value = item.data(0, _BASELINE_ROLE)
+            self._apply_modified_style(
+                item, self._values_differ(value, baseline_value)
+            )
+        finally:
+            self._suppress_edits = False
+        return True
+
+    def _fast_update_pz(self, stage, kind, index, value):
+        item = self._pz_index.get((id(stage), kind, index))
+        if item is None:
+            return False
+        self._suppress_edits = True
+        try:
+            item.setText(1, f"{value.real} + {value.imag}j")
+            baseline_value = item.data(0, _BASELINE_ROLE)
+            self._apply_modified_style(
+                item, self._values_differ(value, baseline_value)
+            )
+        finally:
+            self._suppress_edits = False
+        return True
 
 
 class ResponseSelectionDialog(QDialog):

@@ -9,12 +9,38 @@ from PyQt5.QtWidgets import (
     QLineEdit,
     QInputDialog,
     QHBoxLayout,
+    QShortcut,
 )
-from PyQt5.QtGui import QColor, QFont, QBrush
+from PyQt5.QtGui import QColor, QBrush, QKeySequence
 from PyQt5.QtCore import Qt
 from obspy import UTCDateTime
 from obspy.core.inventory import Station, Channel
 from obspy.core.inventory.response import Response
+
+
+_BASELINE_ROLE = Qt.UserRole + 1
+_FIELDS_CACHE = {}
+
+
+def _editable_attrs(obj):
+    cls = type(obj)
+    cached = _FIELDS_CACHE.get(cls)
+    if cached is not None:
+        return cached
+    names = []
+    for name in dir(obj):
+        if name.startswith("_"):
+            continue
+        try:
+            val = getattr(obj, name)
+        except Exception:
+            continue
+        if callable(val):
+            continue
+        names.append(name)
+    names.sort()
+    _FIELDS_CACHE[cls] = names
+    return names
 
 
 class ExplorerTab(QWidget):
@@ -23,6 +49,10 @@ class ExplorerTab(QWidget):
         self.filepath = filepath
         self.main_window = main_window
         self.current_inventory = None
+        self.undo_stack = []
+        self._suppress_edits = False
+        self._item_index = {}
+        self._baseline_snapshot = {}
 
         layout = QVBoxLayout(self)
 
@@ -65,6 +95,10 @@ class ExplorerTab(QWidget):
         self.tree.itemSelectionChanged.connect(self.on_tree_selection_changed)
         self.info_label = QLabel(f"Loaded file: {filepath}")
         layout.addWidget(self.info_label)
+
+        self.undo_shortcut = QShortcut(QKeySequence.Undo, self)
+        self.undo_shortcut.setContext(Qt.WidgetWithChildrenShortcut)
+        self.undo_shortcut.activated.connect(self.undo)
 
     def navigate_to(
         self, net_code, sta_code, chan_code,
@@ -266,6 +300,7 @@ class ExplorerTab(QWidget):
                 code="STA", latitude=0.0, longitude=0.0, elevation=0.0
             )
             obj.stations.append(sta)
+            self._push_undo(("add_station", obj, sta))
         elif choice == "New Channel":
             chan = Channel(
                 code="BHZ", location_code="",
@@ -275,8 +310,11 @@ class ExplorerTab(QWidget):
             )
             chan.response = Response()
             obj.channels.append(chan)
+            self._push_undo(("add_channel", obj, chan))
         else:
+            prev_value = getattr(obj, choice, None)
             self._set_field(obj, choice)
+            self._push_undo(("add_field", obj, choice, prev_value))
         self.populate_tree(self.current_inventory)
 
     def apply_modified_response(self, response):
@@ -299,9 +337,7 @@ class ExplorerTab(QWidget):
             )
 
     def add_object_fields(self, parent_item, obj):
-        for field in sorted(dir(obj)):
-            if field.startswith("_") or callable(getattr(obj, field)):
-                continue
+        for field in _editable_attrs(obj):
             value = getattr(obj, field)
             if isinstance(value, UTCDateTime):
                 item = QTreeWidgetItem(
@@ -315,6 +351,44 @@ class ExplorerTab(QWidget):
                 )
                 item.setFlags(item.flags() | Qt.ItemIsEditable)
                 item.setData(0, Qt.UserRole, (obj, field))
+            else:
+                continue
+            key = (id(obj), field)
+            if key not in self._baseline_snapshot:
+                self._baseline_snapshot[key] = value
+            baseline_value = self._baseline_snapshot[key]
+            item.setData(0, _BASELINE_ROLE, baseline_value)
+            if self._values_differ(value, baseline_value):
+                self._apply_modified_style(item, True)
+            self._item_index[key] = item
+
+    @staticmethod
+    def _values_differ(current, baseline):
+        if isinstance(current, UTCDateTime) or isinstance(
+            baseline, UTCDateTime
+        ):
+            return str(current) != str(baseline)
+        return current != baseline
+
+    def _apply_modified_style(self, item, modified):
+        font = item.font(1)
+        font.setBold(modified)
+        item.setFont(1, font)
+        if modified:
+            item.setForeground(1, QBrush(QColor("royalblue")))
+            item.setData(1, Qt.UserRole, "modified")
+        else:
+            item.setForeground(1, QBrush())
+            item.setData(1, Qt.UserRole, None)
+
+    @staticmethod
+    def _find_match(items, target, keys):
+        for it in items:
+            if all(
+                getattr(it, k, None) == getattr(target, k, None) for k in keys
+            ):
+                return it
+        return None
 
     def _save_tree_state(self):
         # Save expanded paths and selected item path.
@@ -353,7 +427,11 @@ class ExplorerTab(QWidget):
 
     def populate_tree(self, inv):
         expanded, selected_path = self._save_tree_state()
+        self._suppress_edits = True
+        self.tree.setUpdatesEnabled(False)
+        self.tree.blockSignals(True)
         self.tree.clear()
+        self._item_index = {}
         self.current_inventory = inv
         try:
             for net in inv.networks:
@@ -455,8 +533,14 @@ class ExplorerTab(QWidget):
                                         )
         except Exception as e:
             QTreeWidgetItem(self.tree, ["Error", str(e)])
-        self._restore_tree_state(expanded, selected_path)
-        self.filter_tree()
+        if expanded or selected_path:
+            self._restore_tree_state(expanded, selected_path)
+        if (self.station_filter.text().strip()
+                or self.search_bar.text().strip()):
+            self.filter_tree()
+        self.tree.blockSignals(False)
+        self.tree.setUpdatesEnabled(True)
+        self._suppress_edits = False
 
     def on_tree_selection_changed(self):
         item = self.tree.currentItem()
@@ -524,7 +608,11 @@ class ExplorerTab(QWidget):
             net_code = net_label.replace("Network: ", "").strip()
             for net in self.current_inventory.networks:
                 if net.code == net_code and sta in net.stations:
+                    idx = net.stations.index(sta)
                     net.stations.remove(sta)
+                    self._push_undo(
+                        ("delete_station", net, sta, idx)
+                    )
                     break
             self.populate_tree(self.current_inventory)
             return
@@ -551,7 +639,9 @@ class ExplorerTab(QWidget):
             )
             if reply != QMessageBox.Yes:
                 return
+            idx = sta.channels.index(chan)
             sta.channels.remove(chan)
+            self._push_undo(("delete_channel", sta, chan, idx))
             self.populate_tree(self.current_inventory)
             return
 
@@ -565,11 +655,13 @@ class ExplorerTab(QWidget):
             )
             if reply != QMessageBox.Yes:
                 return
+            old_value = getattr(obj, field, None)
             setattr(obj, field, None)
+            self._push_undo(("delete_field", obj, field, old_value))
             self.populate_tree(self.current_inventory)
 
     def handle_tree_edit(self, item, column):
-        if column != 1:
+        if column != 1 or self._suppress_edits:
             return
 
         ref = item.data(0, Qt.UserRole)
@@ -595,20 +687,26 @@ class ExplorerTab(QWidget):
                 new_value = float(new_value)
             elif isinstance(old_value, int):
                 new_value = int(new_value)
+
+            self._push_undo(("edit", ref_object, attr, old_value))
             setattr(ref_object, attr, new_value)
 
-            font = QFont()
-            font.setBold(True)
-            item.setFont(1, font)
-            item.setForeground(1, QBrush(QColor("royalblue")))
-
-            item.setData(1, Qt.UserRole, "modified")
+            baseline_value = item.data(0, _BASELINE_ROLE)
+            self._suppress_edits = True
+            try:
+                self._apply_modified_style(
+                    item, self._values_differ(new_value, baseline_value)
+                )
+            finally:
+                self._suppress_edits = False
 
         except Exception as e:
             QMessageBox.warning(
                 self, "Edit Error", f"Failed to update {attr}: {e}"
             )
+            self._suppress_edits = True
             item.setText(1, str(old_value))
+            self._suppress_edits = False
 
     def handle_tree_double_click(self, item, column):
         data = item.data(0, Qt.UserRole)
@@ -693,3 +791,84 @@ class ExplorerTab(QWidget):
         if visible and prop_text:
             item.setExpanded(True)
         return visible
+
+    _UNDO_LIMIT = 100
+
+    def _push_undo(self, op):
+        self.undo_stack.append(op)
+        if len(self.undo_stack) > self._UNDO_LIMIT:
+            self.undo_stack = self.undo_stack[-self._UNDO_LIMIT:]
+
+    def _apply_reverse(self, op):
+        tag = op[0]
+        if tag == "edit":
+            _, ref_object, attr, old_value = op
+            setattr(ref_object, attr, old_value)
+            return ("field", ref_object, attr, old_value)
+        if tag == "add_station":
+            _, network, station = op
+            if station in network.stations:
+                network.stations.remove(station)
+            return ("structural",)
+        if tag == "add_channel":
+            _, station, channel = op
+            if channel in station.channels:
+                station.channels.remove(channel)
+            return ("structural",)
+        if tag == "add_field":
+            _, obj, attr, prev_value = op
+            setattr(obj, attr, prev_value)
+            return ("structural",)
+        if tag == "delete_station":
+            _, network, station, index = op
+            network.stations.insert(index, station)
+            return ("structural",)
+        if tag == "delete_channel":
+            _, station, channel, index = op
+            station.channels.insert(index, channel)
+            return ("structural",)
+        if tag == "delete_field":
+            _, obj, attr, old_value = op
+            setattr(obj, attr, old_value)
+            return ("field", obj, attr, old_value)
+        return ("structural",)
+
+    def undo(self):
+        if not self.undo_stack:
+            return
+        op = self.undo_stack.pop()
+        fast = False
+        try:
+            result = self._apply_reverse(op)
+            if result[0] == "field":
+                _, ref_object, attr, value = result
+                fast = self._fast_update_item(ref_object, attr, value)
+        except Exception as e:
+            QMessageBox.warning(
+                self, "Undo Error", f"Failed to undo: {e}"
+            )
+        if not fast:
+            self.populate_tree(self.current_inventory)
+
+    def _revert_all(self):
+        while self.undo_stack:
+            op = self.undo_stack.pop()
+            try:
+                self._apply_reverse(op)
+            except Exception:
+                pass
+
+    def _fast_update_item(self, ref_object, attr, value):
+        item = self._item_index.get((id(ref_object), attr))
+        if item is None:
+            return False
+        self._suppress_edits = True
+        try:
+            item.setText(1, str(value) if value is not None else "")
+            baseline_value = item.data(0, _BASELINE_ROLE)
+            self._apply_modified_style(
+                item, self._values_differ(value, baseline_value)
+            )
+        finally:
+            self._suppress_edits = False
+        return True
