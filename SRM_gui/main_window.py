@@ -22,6 +22,7 @@ from pathlib import Path
 from obspy.clients.nrl import NRL
 from SRM_core.nrl_index import NRLIndex
 from SRM_gui.index_progress_dialog import IndexProgressDialog
+from SRM_gui.io_progress import IOProgressDialog
 from SRM_gui.manager_tab import ManagerTab
 from SRM_gui.explorer_tab import ExplorerTab
 from SRM_gui.response_tab import ResponseTab
@@ -164,54 +165,116 @@ class MainWindow(QMainWindow):
         self.tabs.tabCloseRequested.connect(self.close_tab)
         self.tabs.tabBar().setTabButton(0, QTabBar.RightSide, None)
 
+    def _run_jobs(self, title, jobs, on_result, on_done=None):
+        if not jobs:
+            if on_done is not None:
+                on_done()
+            return
+        dialog = IOProgressDialog(
+            title, jobs, on_result, on_done, parent=self
+        )
+        dialog.exec_()
+
     def save_all_files(self):
+        items = list(self.loaded_files.items())
+        if not items:
+            return
 
         failed_paths = set()
-        for filepath, inv in self.loaded_files.items():
-            try:
-                inv.write(filepath, format="STATIONXML")
-            except Exception as e:
-                failed_paths.add(filepath)
+        jobs = [
+            (
+                f"Saving {os.path.basename(fp)}...",
+                (lambda fp=fp, inv=inv:
+                 inv.write(fp, format="STATIONXML")),
+            )
+            for fp, inv in items
+        ]
+
+        def on_result(idx, _result, error):
+            if error is not None:
+                fp = items[idx][0]
+                failed_paths.add(fp)
                 QMessageBox.warning(
-                    self, "Error", f"Failed to save {filepath}:\n{e}"
+                    self, "Error", f"Failed to save {fp}:\n{error}"
                 )
 
-        for key, widget in self.open_tabs.items():
-            if key[0] == "explorer" and isinstance(widget, ExplorerTab):
-                if key[1] in failed_paths:
-                    continue
-                widget.undo_stack.clear()
-                widget._baseline_snapshot = {}
-                widget.populate_tree(widget.current_inventory)
-            elif key[0] == "response" and isinstance(widget, ResponseTab):
-                tab_path = getattr(widget.explorer_tab, "filepath", None)
-                if tab_path and tab_path not in failed_paths:
-                    widget.commit_baseline()
+        def on_done():
+            for key, widget in self.open_tabs.items():
+                if key[0] == "explorer" and isinstance(widget, ExplorerTab):
+                    if key[1] in failed_paths:
+                        continue
+                    widget.undo_stack.clear()
+                    widget._baseline_snapshot = {}
+                    widget.populate_tree(widget.current_inventory)
+                elif (key[0] == "response"
+                      and isinstance(widget, ResponseTab)):
+                    tab_path = getattr(
+                        widget.explorer_tab, "filepath", None
+                    )
+                    if tab_path and tab_path not in failed_paths:
+                        widget.commit_baseline()
 
-        self.manager_tab.refresh()
-        if not failed_paths:
-            QMessageBox.information(
-                self, "Save Complete", "All inventories saved successfully."
+            self.manager_tab.refresh()
+            if not failed_paths:
+                QMessageBox.information(
+                    self, "Save Complete",
+                    "All inventories saved successfully.",
+                )
+
+        self._run_jobs("Saving files", jobs, on_result, on_done)
+
+    def _load_paths_with_progress(self, paths):
+        new_paths = []
+        seen = set()
+        for p in paths:
+            try:
+                abs_path = str(Path(p).resolve())
+            except Exception:
+                continue
+            if abs_path in self.loaded_files or abs_path in seen:
+                continue
+            seen.add(abs_path)
+            new_paths.append(abs_path)
+
+        if not new_paths:
+            return
+
+        jobs = [
+            (
+                f"Loading {os.path.basename(p)}...",
+                (lambda p=p: read_inventory(p)),
             )
+            for p in new_paths
+        ]
+
+        def on_result(idx, inv, error):
+            path = new_paths[idx]
+            if error is not None:
+                QMessageBox.warning(
+                    self, "Error", f"Failed to load {path}:\n{error}"
+                )
+                return
+            if inv is None:
+                return
+            self.loaded_files[path] = inv
+            self.manager_tab.add_file_to_tree(path, inv)
+
+        def on_done():
+            self.update_status_bar()
+
+        self._run_jobs("Loading files", jobs, on_result, on_done)
 
     def add_data(self):
         folder = QFileDialog.getExistingDirectory(self, "Select Data Folder")
         if not folder:
             return
-
         exts = (".xml", ".dataless", ".dless")
-        for file in Path(folder).rglob("*"):
-            if file.suffix.lower() in exts:
-                try:
-                    abs_path = str(file.resolve())
-                    inv = read_inventory(abs_path)
-                    self.loaded_files[abs_path] = inv
-                    self.manager_tab.add_file_to_tree(abs_path, inv)
-                except Exception as e:
-                    QMessageBox.warning(
-                        self, "Error", f"Failed to load {file}:\n{e}"
-                    )
-        self.update_status_bar()
+        paths = [
+            str(f.resolve())
+            for f in Path(folder).rglob("*")
+            if f.suffix.lower() in exts
+        ]
+        self._load_paths_with_progress(paths)
 
     def add_files(self):
         filepaths, _ = QFileDialog.getOpenFileNames(
@@ -223,14 +286,7 @@ class MainWindow(QMainWindow):
         )
         if not filepaths:
             return
-
-        loaded = 0
-        for filepath in filepaths:
-            if self._load_file(filepath):
-                loaded += 1
-
-        if loaded:
-            self.update_status_bar()
+        self._load_paths_with_progress(filepaths)
 
     def open_explorer_tab(self, filepath, inventory, force_new=False):
         if not force_new:
@@ -432,29 +488,12 @@ class MainWindow(QMainWindow):
                     return
 
     def dropEvent(self, event):
-        loaded = 0
+        paths = []
         for url in event.mimeData().urls():
-            path = url.toLocalFile()
-            if path.lower().endswith(('.xml', '.dataless', '.dless')):
-                if self._load_file(path):
-                    loaded += 1
-        if loaded:
-            self.update_status_bar()
-
-    def _load_file(self, filepath):
-        abs_path = str(Path(filepath).resolve())
-        if abs_path in self.loaded_files:
-            return False
-        try:
-            inv = read_inventory(abs_path)
-            self.loaded_files[abs_path] = inv
-            self.manager_tab.add_file_to_tree(abs_path, inv)
-            return True
-        except Exception as e:
-            QMessageBox.warning(
-                self, "Error", f"Failed to load {filepath}:\n{e}"
-            )
-            return False
+            p = url.toLocalFile()
+            if p.lower().endswith(('.xml', '.dataless', '.dless')):
+                paths.append(p)
+        self._load_paths_with_progress(paths)
 
     def update_status_bar(self):
         n_files = len(self.loaded_files)
