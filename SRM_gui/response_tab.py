@@ -454,6 +454,32 @@ class ResponseTab(QWidget):
                 issue_child.setForeground(1, QBrush(QColor(color)))
         self._suppress_edits = False
 
+    def _find_stage_tree_item_by_data(self, ref):
+        def walk(item):
+            if item.data(0, Qt.UserRole) == ref:
+                return item
+            for i in range(item.childCount()):
+                found = walk(item.child(i))
+                if found is not None:
+                    return found
+            return None
+
+        for i in range(self.stage_tree.topLevelItemCount()):
+            found = walk(self.stage_tree.topLevelItem(i))
+            if found is not None:
+                return found
+        return None
+
+    def _focus_stage_tree_item(self, item):
+        if item is None:
+            return
+        parent = item.parent()
+        while parent is not None:
+            parent.setExpanded(True)
+            parent = parent.parent()
+        self.stage_tree.setCurrentItem(item)
+        self.stage_tree.scrollToItem(item)
+
     def handle_response_edit(self, item, column):
         if column != 1 or self._suppress_edits:
             return
@@ -673,16 +699,24 @@ class ResponseTab(QWidget):
 
             if ref_type == "zero":
                 stage = ref[1]
+                new_index = len(stage.zeros)
                 stage.zeros.append(complex(0.0, 0.0))
                 self._push_undo(("add_zero", stage))
                 self.load_response_editor(self.selected_response)
+                self._focus_stage_tree_item(
+                    self._pz_index.get((id(stage), "zero", new_index))
+                )
                 return
 
             elif ref_type == "pole":
                 stage = ref[1]
+                new_index = len(stage.poles)
                 stage.poles.append(complex(0.0, 0.0))
                 self._push_undo(("add_pole", stage))
                 self.load_response_editor(self.selected_response)
+                self._focus_stage_tree_item(
+                    self._pz_index.get((id(stage), "pole", new_index))
+                )
                 return
 
         #  New Stage
@@ -734,12 +768,16 @@ class ResponseTab(QWidget):
             new_stage = builder_func()
 
             if new_stage:
+                new_index = len(self.selected_response.response_stages)
                 self.selected_response.response_stages.append(new_stage)
                 self._renumber_stages()
                 self._push_undo(
                     ("add_stage", self.selected_response, new_stage)
                 )
                 self.load_response_editor(self.selected_response)
+                self._focus_stage_tree_item(
+                    self._find_stage_tree_item_by_data(("stage", new_index))
+                )
                 return
 
         QMessageBox.warning(

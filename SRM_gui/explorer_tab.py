@@ -295,12 +295,14 @@ class ExplorerTab(QWidget):
         if not ok:
             return
 
+        new_ref = None
         if choice == "New Station":
             sta = Station(
                 code="STA", latitude=0.0, longitude=0.0, elevation=0.0
             )
             obj.stations.append(sta)
             self._push_undo(("add_station", obj, sta))
+            new_ref = ("station", sta)
         elif choice == "New Channel":
             chan = Channel(
                 code="BHZ", location_code="",
@@ -311,11 +313,20 @@ class ExplorerTab(QWidget):
             chan.response = Response()
             obj.channels.append(chan)
             self._push_undo(("add_channel", obj, chan))
+            new_ref = ("channel", chan)
         else:
             prev_value = getattr(obj, choice, None)
             self._set_field(obj, choice)
             self._push_undo(("add_field", obj, choice, prev_value))
         self.populate_tree(self.current_inventory)
+        if new_ref is not None:
+            self._focus_tree_item(
+                self._find_tree_item_by_data(new_ref)
+            )
+        else:
+            self._focus_tree_item(
+                self._item_index.get((id(obj), choice))
+            )
 
     def apply_modified_response(self, response):
         updated = False
@@ -424,6 +435,32 @@ class ExplorerTab(QWidget):
 
         for i in range(self.tree.topLevelItemCount()):
             walk(self.tree.topLevelItem(i))
+
+    def _find_tree_item_by_data(self, ref):
+        def walk(item):
+            if item.data(0, Qt.UserRole) == ref:
+                return item
+            for i in range(item.childCount()):
+                found = walk(item.child(i))
+                if found is not None:
+                    return found
+            return None
+
+        for i in range(self.tree.topLevelItemCount()):
+            found = walk(self.tree.topLevelItem(i))
+            if found is not None:
+                return found
+        return None
+
+    def _focus_tree_item(self, item):
+        if item is None:
+            return
+        parent = item.parent()
+        while parent is not None:
+            parent.setExpanded(True)
+            parent = parent.parent()
+        self.tree.setCurrentItem(item)
+        self.tree.scrollToItem(item)
 
     def populate_tree(self, inv):
         expanded, selected_path = self._save_tree_state()

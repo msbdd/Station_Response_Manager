@@ -319,6 +319,7 @@ class ManagerTab(QWidget):
 
         if pasted_item:
             target_item.setExpanded(True)
+            self._focus_tree_item(pasted_item)
 
     def delete_selected_item(self):
         item = self.file_tree.currentItem()
@@ -381,6 +382,16 @@ class ManagerTab(QWidget):
 
         return chan_item
 
+    def _focus_tree_item(self, item):
+        if item is None:
+            return
+        parent = item.parent()
+        while parent is not None:
+            parent.setExpanded(True)
+            parent = parent.parent()
+        self.file_tree.setCurrentItem(item)
+        self.file_tree.scrollToItem(item)
+
     def new_item(self):
         selected_item = self.file_tree.currentItem()
 
@@ -405,8 +416,9 @@ class ManagerTab(QWidget):
             from obspy.core.inventory import Network
             net = Network(code="XX")
             inventory.networks.append(net)
-            self._add_network_to_tree(selected_item, net)
+            new_item = self._add_network_to_tree(selected_item, net)
             selected_item.setExpanded(True)
+            self._focus_tree_item(new_item)
 
         elif type_ == "network":
             net = obj
@@ -414,8 +426,9 @@ class ManagerTab(QWidget):
                 code="STA", latitude=0.0, longitude=0.0, elevation=0.0
             )
             net.stations.append(sta)
-            self._add_station_to_tree(selected_item, sta)
+            new_item = self._add_station_to_tree(selected_item, sta)
             selected_item.setExpanded(True)
+            self._focus_tree_item(new_item)
 
         elif type_ == "station":
             sta = obj
@@ -434,8 +447,9 @@ class ManagerTab(QWidget):
             chan.response = Response()
 
             sta.channels.append(chan)
-            self._add_channel_to_tree(selected_item, chan)
+            new_item = self._add_channel_to_tree(selected_item, chan)
             selected_item.setExpanded(True)
+            self._focus_tree_item(new_item)
 
         else:
             QMessageBox.warning(
