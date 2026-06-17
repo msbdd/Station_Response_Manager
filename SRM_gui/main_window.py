@@ -461,6 +461,7 @@ class MainWindow(QMainWindow):
 
             inv_wizard = StationInventoryWizard(self.nrl_root, parent=self)
             inv_wizard.exec_()
+            self._maybe_load_built_inventory(inv_wizard)
 
         elif reply == QMessageBox.Yes:
 
@@ -473,6 +474,22 @@ class MainWindow(QMainWindow):
                     self.nrl_root, initial_data=initial_data, parent=self
                 )
                 inv_wizard.exec_()
+                self._maybe_load_built_inventory(inv_wizard)
+
+    def _maybe_load_built_inventory(self, wizard):
+        # After the Build Inventory wizard saves a file, offer to load it.
+        path = getattr(wizard, "saved_path", None)
+        if not path:
+            return
+        reply = QMessageBox.question(
+            self,
+            "Load Inventory",
+            f"Load the created inventory now?\n{path}",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.Yes,
+        )
+        if reply == QMessageBox.Yes:
+            self._load_paths_with_progress([path])
 
     def convert_to_xml(self):
         input_path, _ = QFileDialog.getOpenFileName(

@@ -32,6 +32,7 @@ class StationInventoryWizard(QDialog):
         self.resize(800, 600)
         self.inventory = None
         self.groups = {}
+        self.saved_path = None
         self._init_ui()
         if initial_data:
             self._populate_from_initial_data(initial_data)
@@ -191,6 +192,7 @@ class StationInventoryWizard(QDialog):
             )
             if save_path:
                 self.inventory.write(save_path, format="STATIONXML")
+                self.saved_path = save_path
                 QMessageBox.information(
                     self, "Success", f"Inventory saved to:\n{save_path}"
                 )
