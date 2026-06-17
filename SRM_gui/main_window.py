@@ -37,6 +37,9 @@ class MainWindow(QMainWindow):
 
         self.loaded_files = {}
         self.open_tabs = {}
+        # Set when Manager-tab structural edits mutate in-memory inventories
+        # (those edits have no undo stack of their own). Cleared on Save All.
+        self._manager_dirty = False
 
         self.nrl_root = resource_path(os.path.join("resources", "NRL"))
         while True:
@@ -199,6 +202,7 @@ class MainWindow(QMainWindow):
                 )
 
         def on_done():
+            self._manager_dirty = False
             for key, widget in self.open_tabs.items():
                 if key[0] == "explorer" and isinstance(widget, ExplorerTab):
                     if key[1] in failed_paths:
@@ -317,7 +321,9 @@ class MainWindow(QMainWindow):
         return explorer
 
     def open_response_tab(self, response_id, response_data, explorer_tab):
-        key = ("response", response_id)
+        # Key on the Response object's identity, not its display id, so two
+        # channels/epochs that render to the same id still get separate tabs.
+        key = ("response", id(response_data))
         if key not in self.open_tabs:
             response_tab = ResponseTab(
                 response_data, self, explorer_tab, self.nrl_root
@@ -333,6 +339,28 @@ class MainWindow(QMainWindow):
         if index == 0:
             return
         widget = self.tabs.widget(index)
+
+        # Closing a tab reverts its unsaved edits below, so confirm first to
+        # avoid silently discarding the user's work.
+        if isinstance(widget, ExplorerTab):
+            pending = bool(widget.undo_stack) or any(
+                isinstance(t, ResponseTab) and t.explorer_tab is widget
+                and t.undo_stack
+                for t in self.open_tabs.values()
+            )
+        elif isinstance(widget, ResponseTab):
+            pending = bool(widget.undo_stack)
+        else:
+            pending = False
+        if pending:
+            reply = QMessageBox.question(
+                self, "Discard Changes",
+                "This tab has unsaved changes. Discard them?",
+                QMessageBox.Yes | QMessageBox.No, QMessageBox.No,
+            )
+            if reply != QMessageBox.Yes:
+                return
+
         inventory_touched = False
 
         if isinstance(widget, ExplorerTab):
@@ -371,6 +399,31 @@ class MainWindow(QMainWindow):
                         and t.current_inventory is not None):
                     t._baseline_snapshot = {}
                     t.populate_tree(t.current_inventory)
+
+    def has_unsaved_changes(self):
+        if self._manager_dirty:
+            return True
+        for widget in self.open_tabs.values():
+            if (isinstance(widget, (ExplorerTab, ResponseTab))
+                    and widget.undo_stack):
+                return True
+        return False
+
+    def closeEvent(self, event):
+        if self.has_unsaved_changes():
+            reply = QMessageBox.question(
+                self,
+                "Unsaved Changes",
+                "You have unsaved changes. Save before exiting?",
+                QMessageBox.Save | QMessageBox.Discard | QMessageBox.Cancel,
+                QMessageBox.Save,
+            )
+            if reply == QMessageBox.Cancel:
+                event.ignore()
+                return
+            if reply == QMessageBox.Save:
+                self.save_all_files()
+        event.accept()
 
     def create_new_inventory(self):
         filepath, _ = QFileDialog.getSaveFileName(

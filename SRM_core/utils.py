@@ -8,13 +8,6 @@ import colorsys
 from datetime import datetime, timezone as _tz
 
 
-def parse_response(path):
-    try:
-        return read_inventory(path)
-    except Exception as e:
-        return e
-
-
 def combine_resp(sensor_resp, recorder_resp):
     result = deepcopy(recorder_resp)
     sensor_stage0 = deepcopy(sensor_resp.response_stages[0])

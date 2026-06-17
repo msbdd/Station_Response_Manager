@@ -1,8 +1,12 @@
+import logging
+
 from PyQt5.QtWidgets import (
     QDialog, QVBoxLayout, QLabel, QProgressBar,
     QPushButton, QApplication
 )
 from PyQt5.QtCore import Qt, QThread, pyqtSignal
+
+logger = logging.getLogger(__name__)
 
 
 class IndexBuildWorker(QThread):
@@ -17,25 +21,23 @@ class IndexBuildWorker(QThread):
 
     def run(self):
         try:
-            print(f"[DEBUG] Starting index build for: "
-                  f"{self.nrl_index.nrl_root}")
-            print(f"[DEBUG] Index path: {self.nrl_index.index_path}")
+            logger.debug("Starting index build for: %s",
+                         self.nrl_index.nrl_root)
+            logger.debug("Index path: %s", self.nrl_index.index_path)
 
             def progress_callback(current, total, message):
-                print(f"[DEBUG] Progress: {current}/{total} - {message}")
+                logger.debug("Progress: %s/%s - %s", current, total, message)
                 self.progress.emit(current, total, message)
 
             sensors, dataloggers = self.nrl_index.build_index(
                 progress_callback
                 )
-            print(f"[DEBUG] Build complete: {sensors} sensors, "
-                  f"{dataloggers} dataloggers")
+            logger.debug("Build complete: %s sensors, %s dataloggers",
+                         sensors, dataloggers)
             self.finished.emit(sensors, dataloggers)
 
         except Exception as e:
-            import traceback
-            error_msg = f"{e}\n{traceback.format_exc()}"
-            print(f"[DEBUG] Error: {error_msg}")
+            logger.exception("NRL index build failed")
             self.error.emit(str(e))
 
 

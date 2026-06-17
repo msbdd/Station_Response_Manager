@@ -1,12 +1,15 @@
 import os
 import json
 import hashlib
+import logging
 import configparser
 from math import log10, floor, isfinite
 from typing import Optional, Tuple, Dict, List
 from dataclasses import dataclass, asdict
 from obspy import read_inventory
 from obspy.core.inventory.response import Response
+
+logger = logging.getLogger(__name__)
 
 HASH_SIG_FIGS = 5
 
@@ -236,7 +239,7 @@ class NRLIndex:
 
             return True
         except (json.JSONDecodeError, IOError, KeyError) as e:
-            print(f"Error loading NRL index: {e}")
+            logger.error("Error loading NRL index: %s", e)
             return False
 
     def save_index(self) -> bool:
@@ -262,7 +265,7 @@ class NRLIndex:
             self._index = data
             return True
         except IOError as e:
-            print(f"Error saving NRL index: {e}")
+            logger.error("Error saving NRL index: %s", e)
             return False
 
     def build_index(self, progress_callback=None) -> Tuple[int, int]:
@@ -319,7 +322,7 @@ class NRLIndex:
                         self._sensor_signatures[sig] = []
                     self._sensor_signatures[sig].append(instrument)
             except Exception as e:
-                print(f"Error indexing sensor {xml_path}: {e}")
+                logger.warning("Error indexing sensor %s: %s", xml_path, e)
 
         for xml_path, info in datalogger_files:
             current += 1
@@ -357,7 +360,7 @@ class NRLIndex:
                             instrument
                         )
             except Exception as e:
-                print(f"Error indexing datalogger {xml_path}: {e}")
+                logger.warning("Error indexing datalogger %s: %s", xml_path, e)
 
         if progress_callback:
             progress_callback(total_files, total_files, "Saving index...")
@@ -463,7 +466,7 @@ class NRLIndex:
 
                 return sig, stage0_gain
         except Exception as e:
-            print(f"Could not read sensor {xml_path}: {e}")
+            logger.debug("Could not read sensor %s: %s", xml_path, e)
         return None, None
 
     def _compute_datalogger_info_from_file(
@@ -502,7 +505,7 @@ class NRLIndex:
 
                 return exact_sig, stage0_gain, adc_gain, family_sig
         except Exception as e:
-            print(f"Could not read datalogger {xml_path}: {e}")
+            logger.debug("Could not read datalogger %s: %s", xml_path, e)
         return None, None, None, None
 
     def _compute_dl_sig_with_preamp(

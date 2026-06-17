@@ -193,6 +193,10 @@ class ExplorerTab(QWidget):
         "historical_code", "restricted_status", "source_id", "start_date",
         "water_level",
     ]
+    # Integer-typed fields whose ObsPy setter validates the value, so a raw
+    # string would raise. Float fields (water_level, clock_drift, ...) are
+    # coerced by ObsPy automatically and need no special handling.
+    _INT_FIELDS = {"total_number_of_stations"}
 
     def _find_header_item(self, item):
         # Walk up to the nearest Network/Station/Channel header
@@ -209,6 +213,11 @@ class ExplorerTab(QWidget):
         label = header_item.text(0)
         inv = self.current_inventory
         if label.startswith("Network: "):
+            # Resolve via the stored object ref so an inline code edit (which
+            # leaves the header label stale) doesn't break resolution.
+            ref = header_item.data(0, Qt.UserRole)
+            if ref and isinstance(ref, tuple) and ref[0] == "network":
+                return ref[1]
             code = label.replace("Network: ", "").strip()
             return next(
                 (n for n in inv.networks if n.code == code), None
@@ -326,25 +335,6 @@ class ExplorerTab(QWidget):
         else:
             self._focus_tree_item(
                 self._item_index.get((id(obj), choice))
-            )
-
-    def apply_modified_response(self, response):
-        updated = False
-        for net in self.current_inventory.networks:
-            for sta in net.stations:
-                for chan in sta.channels:
-                    if chan.response is response:
-                        chan.response = response
-                        updated = True
-
-        if updated:
-            QMessageBox.information(
-                self, "Saved", "Response updated successfully."
-            )
-            self.populate_tree(self.current_inventory)
-        else:
-            QMessageBox.warning(
-                self, "Error", "Response not found in inventory."
             )
 
     def add_object_fields(self, parent_item, obj):
@@ -473,6 +463,7 @@ class ExplorerTab(QWidget):
         try:
             for net in inv.networks:
                 net_item = QTreeWidgetItem([f"Network: {net.code}", ""])
+                net_item.setData(0, Qt.UserRole, ("network", net))
                 self.tree.addTopLevelItem(net_item)
                 self.add_object_fields(net_item, net)
 
@@ -720,6 +711,8 @@ class ExplorerTab(QWidget):
                     new_value = UTCDateTime(new_value)
                 else:
                     new_value = None
+            elif old_value is None and attr in self._INT_FIELDS:
+                new_value = int(new_value) if new_value.strip() else None
             elif isinstance(old_value, float):
                 new_value = float(new_value)
             elif isinstance(old_value, int):
@@ -770,7 +763,14 @@ class ExplorerTab(QWidget):
             sta_code = sta_item.text(0).replace("Station: ", "").strip()
             net_code = net_item.text(0).replace("Network: ", "").strip()
 
-            unique_id = f"{net_code}.{sta_code}..{chan_code}"
+            # Include the location code so channels that share a code but
+            # differ by location (e.g. 00.BHZ / 10.BHZ) get distinct ids.
+            chan_ref = chan_item.data(0, Qt.UserRole)
+            loc_code = ""
+            if (chan_ref and isinstance(chan_ref, tuple)
+                    and chan_ref[0] == "channel"):
+                loc_code = chan_ref[1].location_code or ""
+            unique_id = f"{net_code}.{sta_code}.{loc_code}.{chan_code}"
 
             self.main_window.open_response_tab(
                 response_id=unique_id,

@@ -10,7 +10,6 @@ from PyQt5.QtWidgets import (
     QDialog,
     QDialogButtonBox,
     QLineEdit,
-    QComboBox,
     QInputDialog,
     QGroupBox,
     QRadioButton,
@@ -597,61 +596,6 @@ class ResponseTab(QWidget):
                 QMessageBox.warning(
                     self, "Invalid Input", "Please enter valid float numbers."
                 )
-
-    def select_response_from_inventory(self, inventory):
-        dialog = QDialog(self)
-        dialog.setWindowTitle("Select Response to Import")
-        layout = QVBoxLayout(dialog)
-
-        combo = QComboBox()
-        channel_map = {}
-
-        for net in inventory.networks:
-            for sta in net.stations:
-                for chan in sta.channels:
-                    label = (
-                        f"{net.code}.{sta.code}."
-                        f"{chan.location_code}.{chan.code}"
-                    )
-                    combo.addItem(label)
-                    channel_map[label] = chan
-
-        layout.addWidget(QLabel("Select Channel Response:"))
-        layout.addWidget(combo)
-
-        buttons = QDialogButtonBox(
-            QDialogButtonBox.Ok | QDialogButtonBox.Cancel
-        )
-        layout.addWidget(buttons)
-
-        buttons.accepted.connect(dialog.accept)
-        buttons.rejected.connect(dialog.reject)
-
-        if dialog.exec_() == QDialog.Accepted:
-            selected = combo.currentText()
-            chan_to_copy = channel_map[selected]
-
-            if hasattr(self, "selected_response") and self.selected_response:
-                new_response = chan_to_copy.response
-                if new_response:
-                    self.selected_response.response_stages = copy.deepcopy(
-                        new_response.response_stages
-                    )
-                    self.selected_response.instrument_sensitivity = (
-                        copy.deepcopy(new_response.instrument_sensitivity)
-                    )
-
-                    QMessageBox.information(
-                        self, "Success", "Response replaced successfully."
-                    )
-                    self.load_response_editor(self.selected_response)
-                    self.plot_response(self.selected_response)
-                else:
-                    QMessageBox.warning(
-                        self,
-                        "No Response",
-                        "Selected channel has no response.",
-                    )
 
     def replace_response(self):
         dlg = ResponseSelectionDialog(self.nrl_root, self)

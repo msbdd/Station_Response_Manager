@@ -320,6 +320,7 @@ class ManagerTab(QWidget):
         if pasted_item:
             target_item.setExpanded(True)
             self._focus_tree_item(pasted_item)
+            self._mark_changed()
 
     def delete_selected_item(self):
         item = self.file_tree.currentItem()
@@ -339,20 +340,32 @@ class ManagerTab(QWidget):
 
         type_, obj = data
 
-        if type_ == "station" and parent:
+        if type_ not in ("station", "channel") or not parent:
+            QMessageBox.warning(
+                self, "Invalid Delete", "Cannot delete this type of item."
+            )
+            return
+
+        reply = QMessageBox.question(
+            self, "Confirm Delete",
+            f"Delete {item.text(0)}?",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No,
+        )
+        if reply != QMessageBox.Yes:
+            return
+
+        if type_ == "station":
             net_data = parent.data(0, Qt.UserRole)
             if net_data and net_data[0] == "network":
                 net_data[1].stations.remove(obj)
                 parent.removeChild(item)
-        elif type_ == "channel" and parent:
+                self._mark_changed()
+        elif type_ == "channel":
             sta_data = parent.data(0, Qt.UserRole)
             if sta_data and sta_data[0] == "station":
                 sta_data[1].channels.remove(obj)
                 parent.removeChild(item)
-        else:
-            QMessageBox.warning(
-                self, "Invalid Delete", "Cannot delete this type of item."
-            )
+                self._mark_changed()
 
     def _add_network_to_tree(self, file_item, net):
         net_item = QTreeWidgetItem([f"Network: {net.code}"])
@@ -419,6 +432,7 @@ class ManagerTab(QWidget):
             new_item = self._add_network_to_tree(selected_item, net)
             selected_item.setExpanded(True)
             self._focus_tree_item(new_item)
+            self._mark_changed()
 
         elif type_ == "network":
             net = obj
@@ -429,6 +443,7 @@ class ManagerTab(QWidget):
             new_item = self._add_station_to_tree(selected_item, sta)
             selected_item.setExpanded(True)
             self._focus_tree_item(new_item)
+            self._mark_changed()
 
         elif type_ == "station":
             sta = obj
@@ -450,6 +465,7 @@ class ManagerTab(QWidget):
             new_item = self._add_channel_to_tree(selected_item, chan)
             selected_item.setExpanded(True)
             self._focus_tree_item(new_item)
+            self._mark_changed()
 
         else:
             QMessageBox.warning(
@@ -515,3 +531,29 @@ class ManagerTab(QWidget):
         self.network_colors.clear()
         for filepath, inventory in self.main_window.loaded_files.items():
             self.add_file_to_tree(filepath, inventory)
+
+    def _refresh_side_views(self):
+        # Rebuild map markers, timeline and status bar after a structural
+        # edit in the file tree (new / paste / delete), which otherwise leave
+        # these views stale.
+        self.all_stations = []
+        for inventory in self.main_window.loaded_files.values():
+            for net in inventory.networks:
+                color = self.get_color_for_network(net.code)
+                for sta in net.stations:
+                    self.all_stations.append({
+                        "name": f"{net.code}.{sta.code}",
+                        "lat": sta.latitude,
+                        "lon": sta.longitude,
+                        "network": net.code,
+                        "color": color,
+                    })
+        js_code = f"addStations({json.dumps(self.all_stations)});"
+        self.map_view.page().runJavaScript(js_code)
+        self.update_timeline()
+        self.main_window.update_status_bar()
+
+    def _mark_changed(self):
+        # Flag in-memory edits as unsaved and refresh dependent views.
+        self.main_window._manager_dirty = True
+        self._refresh_side_views()
