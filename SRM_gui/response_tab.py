@@ -51,6 +51,15 @@ from obspy.clients.nrl import NRL
 
 _BASELINE_ROLE = Qt.UserRole + 1
 
+_UNIT_ATTRS = ("input_units", "output_units")
+
+
+def _units_label(stage):
+    """Compact 'in → out' unit-chain label for a stage header row."""
+    in_u = getattr(stage, "input_units", None) or ""
+    out_u = getattr(stage, "output_units", None) or ""
+    return f"{in_u} → {out_u}" if (in_u or out_u) else ""
+
 
 class MplCanvas(FigureCanvas):
     def __init__(self, parent=None):
@@ -372,13 +381,24 @@ class ResponseTab(QWidget):
                 sens_item, "Frequency", sens.frequency,
                 (sens, "frequency"), base_freq,
             )
+            self._set_editable_item(
+                sens_item, "Input Units", sens.input_units or "",
+                (sens, "input_units"),
+                (getattr(baseline_sens, "input_units", None) or ""),
+            )
+            self._set_editable_item(
+                sens_item, "Output Units", sens.output_units or "",
+                (sens, "output_units"),
+                (getattr(baseline_sens, "output_units", None) or ""),
+            )
 
         for i, stage in enumerate(response.response_stages):
             baseline_stage = (
                 baseline_stages[i] if i < len(baseline_stages) else None
             )
             stage_item = QTreeWidgetItem(
-                self.stage_tree, [f"Stage {i+1}: {type(stage).__name__}", ""]
+                self.stage_tree,
+                [f"Stage {i+1}: {type(stage).__name__}", _units_label(stage)],
             )
             stage_item.setData(0, Qt.UserRole, ("stage", i))
             if hasattr(stage, "stage_gain"):
@@ -396,6 +416,14 @@ class ResponseTab(QWidget):
                     stage.normalization_frequency,
                     (stage, "normalization_frequency"), base_nf,
                 )
+            for label, attr in (("Input Units", "input_units"),
+                                ("Output Units", "output_units")):
+                if hasattr(stage, attr):
+                    self._set_editable_item(
+                        stage_item, label, getattr(stage, attr) or "",
+                        (stage, attr),
+                        (getattr(baseline_stage, attr, None) or ""),
+                    )
 
             if hasattr(stage, "poles"):
                 poles_item = QTreeWidgetItem(stage_item, ["Poles", ""])
@@ -433,25 +461,62 @@ class ResponseTab(QWidget):
                     )
                     self._pz_index[(id(stage), "zero", j)] = zero_item
 
-        issues = validate_response(response)
-        if issues:
-            issues_item = QTreeWidgetItem(
-                self.stage_tree, ["Validation Warnings", ""]
-            )
-            issues_item.setForeground(0, QBrush(QColor("#e65100")))
-            font = issues_item.font(0)
-            font.setBold(True)
-            issues_item.setFont(0, font)
-            issues_item.setExpanded(True)
-            for severity, msg in issues:
-                issue_child = QTreeWidgetItem(
-                    issues_item,
-                    [severity.upper(), msg],
-                )
-                color = "#c62828" if severity == "error" else "#e65100"
-                issue_child.setForeground(0, QBrush(QColor(color)))
-                issue_child.setForeground(1, QBrush(QColor(color)))
+        self._add_validation_section(response)
         self._suppress_edits = False
+
+    def _add_validation_section(self, response):
+        issues = validate_response(response)
+        if not issues:
+            return
+        issues_item = QTreeWidgetItem(
+            self.stage_tree, ["Validation Warnings", ""]
+        )
+        issues_item.setData(0, Qt.UserRole, ("validation_section",))
+        issues_item.setForeground(0, QBrush(QColor("#e65100")))
+        font = issues_item.font(0)
+        font.setBold(True)
+        issues_item.setFont(0, font)
+        issues_item.setExpanded(True)
+        for severity, msg in issues:
+            issue_child = QTreeWidgetItem(
+                issues_item,
+                [severity.upper(), msg],
+            )
+            color = "#c62828" if severity == "error" else "#e65100"
+            issue_child.setForeground(0, QBrush(QColor(color)))
+            issue_child.setForeground(1, QBrush(QColor(color)))
+
+    def _refresh_validation_section(self):
+        """Rebuild the Validation Warnings block after a value change so a
+        fixed (or newly introduced) issue is reflected immediately."""
+        self._suppress_edits = True
+        try:
+            for i in reversed(range(self.stage_tree.topLevelItemCount())):
+                it = self.stage_tree.topLevelItem(i)
+                d = it.data(0, Qt.UserRole)
+                if (isinstance(d, tuple) and d
+                        and d[0] == "validation_section"):
+                    self.stage_tree.takeTopLevelItem(i)
+            self._add_validation_section(self.selected_response)
+        finally:
+            self._suppress_edits = False
+
+    def _sync_units_display(self, ref_object, attr):
+        """Keep the 'in → out' label on the stage header row in step with
+        the stage's edited unit fields."""
+        if attr not in _UNIT_ATTRS:
+            return
+        item = self._field_index.get((id(ref_object), attr))
+        parent = item.parent() if item is not None else None
+        if parent is None:
+            return
+        pref = parent.data(0, Qt.UserRole)
+        if isinstance(pref, tuple) and pref and pref[0] == "stage":
+            self._suppress_edits = True
+            try:
+                parent.setText(1, _units_label(ref_object))
+            finally:
+                self._suppress_edits = False
 
     def _find_stage_tree_item_by_data(self, ref):
         def walk(item):
@@ -499,6 +564,9 @@ class ResponseTab(QWidget):
                 new_value = float(new_text)
             elif isinstance(old_value, int):
                 new_value = int(new_text)
+            elif attr in _UNIT_ATTRS:
+                # Unit fields are plain strings; blank means "not set".
+                new_value = new_text.strip() or None
             else:
                 new_value = new_text
 
@@ -514,6 +582,8 @@ class ResponseTab(QWidget):
             finally:
                 self._suppress_edits = False
 
+            self._sync_units_display(ref_object, attr)
+            self._refresh_validation_section()
             self.plot_response(self.selected_response)
 
         except Exception as e:
@@ -1108,6 +1178,9 @@ class ResponseTab(QWidget):
                 self, "Undo Error", f"Failed to undo: {e}"
             )
         if fast:
+            if result[0] == "field":
+                self._sync_units_display(result[1], result[2])
+            self._refresh_validation_section()
             self.plot_response(self.selected_response)
         else:
             self.load_response_editor(self.selected_response)

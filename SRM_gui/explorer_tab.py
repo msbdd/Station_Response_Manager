@@ -16,6 +16,7 @@ from PyQt5.QtCore import Qt
 from obspy import UTCDateTime
 from obspy.core.inventory import Station, Channel
 from obspy.core.inventory.response import Response
+from SRM_gui.validation_ui import build_issue_items, tint_warning
 
 
 _BASELINE_ROLE = Qt.UserRole + 1
@@ -466,12 +467,14 @@ class ExplorerTab(QWidget):
                 net_item.setData(0, Qt.UserRole, ("network", net))
                 self.tree.addTopLevelItem(net_item)
                 self.add_object_fields(net_item, net)
+                net_has_issues = False
 
                 for sta in net.stations:
                     sta_item = QTreeWidgetItem([f"Station: {sta.code}", ""])
                     sta_item.setData(0, Qt.UserRole, ("station", sta))
                     net_item.addChild(sta_item)
                     self.add_object_fields(sta_item, sta)
+                    sta_has_issues = False
 
                     for chan in sta.channels:
                         chan_item = QTreeWidgetItem(
@@ -559,6 +562,19 @@ class ExplorerTab(QWidget):
                                                 f"{z.real} + {z.imag}j",
                                             ],
                                         )
+
+                        warn_item = build_issue_items(chan, two_columns=True)
+                        if warn_item is not None:
+                            chan_item.insertChild(0, warn_item)
+                            tint_warning(chan_item)
+                            sta_has_issues = True
+
+                    if sta_has_issues:
+                        tint_warning(sta_item)
+                        net_has_issues = True
+
+                if net_has_issues:
+                    tint_warning(net_item)
         except Exception as e:
             QTreeWidgetItem(self.tree, ["Error", str(e)])
         if expanded or selected_path:

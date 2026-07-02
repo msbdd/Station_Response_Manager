@@ -14,7 +14,7 @@ from PyQt5.QtWebEngineWidgets import QWebEngineView
 from PyQt5.QtGui import QColor, QBrush
 from PyQt5.QtCore import Qt, QTimer, QUrl
 from SRM_gui.timeline import TimelineWidget
-from SRM_core.utils import validate_response
+from SRM_gui.validation_ui import build_issue_items, tint_warning
 import json
 import colorsys
 from obspy import Inventory
@@ -22,10 +22,6 @@ from obspy.core.inventory import Station, Channel
 from obspy.core.inventory.response import Response
 import os
 from pathlib import Path
-
-# Amber used to flag channels/stations/networks with metadata validation issues
-# (distinct from the green sensor / blue digitizer detection annotations).
-_WARNING_COLOR = "#c77700"
 
 
 class ManagerTab(QWidget):
@@ -250,34 +246,17 @@ class ManagerTab(QWidget):
             chan_item.addChild(dl_item)
 
     def _add_validation_warnings(self, chan_item, channel):
-        """Attach an amber warning node listing metadata issues for this
+        """Attach a warning node with one row per metadata issue for this
         channel's response. Returns True if any issue was found."""
-        if not channel.response:
+        summary = build_issue_items(channel)
+        if summary is None:
             return False
-        issues = validate_response(channel.response)
-        if not issues:
-            return False
-
-        n = len(issues)
-        warn_item = QTreeWidgetItem(
-            [f"⚠ {n} metadata issue{'s' if n != 1 else ''}"]
-        )
-        warn_item.setData(0, Qt.UserRole, ("validation", channel))
-        warn_item.setForeground(0, QBrush(QColor(_WARNING_COLOR)))
-        font = warn_item.font(0)
-        font.setItalic(True)
-        warn_item.setFont(0, font)
-        warn_item.setFlags(warn_item.flags() & ~Qt.ItemIsSelectable)
-        tooltip = "Metadata validation:\n" + "\n".join(
-            f"  • [{sev}] {msg}" for sev, msg in issues
-        )
-        warn_item.setToolTip(0, tooltip)
-        chan_item.addChild(warn_item)
+        chan_item.addChild(summary)
         self._tint_warning(chan_item)
         return True
 
     def _tint_warning(self, item):
-        item.setForeground(0, QBrush(QColor(_WARNING_COLOR)))
+        tint_warning(item)
 
     def new_explorer_view(self):
         item = self.file_tree.currentItem()
