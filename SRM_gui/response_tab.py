@@ -502,8 +502,8 @@ class ResponseTab(QWidget):
             else:
                 new_value = new_text
 
-            self._push_undo(("edit", ref_object, attr, old_value))
             setattr(ref_object, attr, new_value)
+            self._push_undo(("edit", ref_object, attr, old_value))
 
             baseline_value = item.data(0, _BASELINE_ROLE)
             self._suppress_edits = True

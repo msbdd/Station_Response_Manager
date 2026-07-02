@@ -16,10 +16,9 @@ from PyQt5.QtWidgets import (
     QFileDialog,
 )
 from PyQt5.QtCore import QDateTime
-from SRM_core.utils import wrap_text
+from SRM_core.utils import wrap_text, atomic_write_inventory
 import os
 from obspy import Inventory, UTCDateTime, read
-from obspy.core.inventory.response import Response
 from obspy.core.inventory import Station, Network, Channel
 from SRM_gui.response_tab import ResponseSelectionDialog
 
@@ -104,6 +103,7 @@ class StationInventoryWizard(QDialog):
             "base": QLineEdit("HH"),
             "comp": comp_edit,
             "depth": QLineEdit("0.0"),
+            "rate": QLineEdit("100.0"),
             "date": QDateTimeEdit(QDateTime.currentDateTimeUtc()),
             "resp_label": QLabel("Not Selected"),
             "resp_btn": QPushButton("Select Response..."),
@@ -119,6 +119,7 @@ class StationInventoryWizard(QDialog):
         layout.addRow("Channel Components:", widgets["comp"])
         layout.addRow("Start Date:", widgets["date"])
         layout.addRow("Sensor Depth (m):", widgets["depth"])
+        layout.addRow("Sample Rate (Hz):", widgets["rate"])
         layout.addRow("Instrument Response:", widgets["resp_label"])
         layout.addRow(widgets["resp_btn"])
         return layout
@@ -135,12 +136,14 @@ class StationInventoryWizard(QDialog):
             self.groups[1]["loc"].setText(g1_data.get("locs", ""))
             self.groups[1]["base"].setText(g1_data.get("base", ""))
             self.groups[1]["comp"].setText(g1_data.get("comps", ""))
+            self.groups[1]["rate"].setText(g1_data.get("rate", "100.0"))
         if "group2" in data:
             self.toggle_group2_cb.setChecked(True)
             g2_data = data["group2"]
             self.groups[2]["loc"].setText(g2_data.get("locs", ""))
             self.groups[2]["base"].setText(g2_data.get("base", ""))
             self.groups[2]["comp"].setText(g2_data.get("comps", ""))
+            self.groups[2]["rate"].setText(g2_data.get("rate", "100.0"))
 
     def _select_response(self, group_num):
         dialog = ResponseSelectionDialog(self.nrl_root, self)
@@ -191,7 +194,9 @@ class StationInventoryWizard(QDialog):
                 "StationXML (*.xml)",
             )
             if save_path:
-                self.inventory.write(save_path, format="STATIONXML")
+                atomic_write_inventory(
+                    self.inventory, save_path, fmt="STATIONXML"
+                )
                 self.saved_path = save_path
                 QMessageBox.information(
                     self, "Success", f"Inventory saved to:\n{save_path}"
@@ -220,14 +225,36 @@ class StationInventoryWizard(QDialog):
             )
             return False
         try:
-            float(self.lat_edit.text())
-            float(self.lon_edit.text())
-            float(self.ele_edit.text())
+            lat = float(self.lat_edit.text())
+            lon = float(self.lon_edit.text())
+            ele = float(self.ele_edit.text())
         except ValueError:
             QMessageBox.warning(
                 self,
                 "Input Error",
                 "Latitude, Longitude, and Elevation must be valid numbers.",
+            )
+            return False
+
+        if not -90.0 <= lat <= 90.0:
+            QMessageBox.warning(
+                self,
+                "Input Error",
+                "Latitude must be between -90 and 90 degrees.",
+            )
+            return False
+        if not -180.0 <= lon <= 180.0:
+            QMessageBox.warning(
+                self,
+                "Input Error",
+                "Longitude must be between -180 and 180 degrees.",
+            )
+            return False
+        if not -12000.0 <= ele <= 9000.0:
+            QMessageBox.warning(
+                self,
+                "Input Error",
+                "Elevation (m) must be between -12000 and 9000.",
             )
             return False
 
@@ -255,6 +282,13 @@ class StationInventoryWizard(QDialog):
             raise ValueError(
                 f"{group_name}: An instrument response must be"
                 f" selected for {group_name}."
+            )
+        try:
+            if float(widgets["rate"].text()) <= 0:
+                raise ValueError
+        except ValueError:
+            raise ValueError(
+                f"{group_name}: Sample Rate must be a positive number."
             )
         try:
             float(widgets["depth"].text())
@@ -320,6 +354,7 @@ class StationInventoryWizard(QDialog):
         station_ele = float(self.ele_edit.text())
 
         sensor_depth = float(widgets["depth"].text())
+        rate = float(widgets["rate"].text())
         start_date = UTCDateTime(widgets["date"].dateTime().toPyDateTime())
         response = widgets["response_obj"]
 
@@ -332,13 +367,6 @@ class StationInventoryWizard(QDialog):
                 az, dip = 0, 0
             elif comp.endswith("Z"):
                 az, dip = 0, -90
-
-            rate = (
-                response.instrument_sensitivity.frequency
-                if isinstance(response, Response)
-                and response.instrument_sensitivity
-                else 1.0
-            )
 
             channels.append(
                 Channel(
@@ -455,6 +483,7 @@ class ImportFromMiniSEEDDialog(QDialog):
             "locs": ",".join(locs),
             "base": base,
             "comps": ",".join(comps),
+            "rate": str(traces[0].stats.sampling_rate) if traces else "100.0",
         }
 
     def get_initial_data(self):

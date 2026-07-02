@@ -508,6 +508,32 @@ class NRLIndex:
             logger.debug("Could not read datalogger %s: %s", xml_path, e)
         return None, None, None, None
 
+    def _datalogger_preamp_gain(
+        self, response: Response, adc_idx: int
+    ) -> Optional[float]:
+        """Combined gain of the datalogger's analog gain (preamp) stages.
+
+        A preamp / analog gain stage is any stage before the ADC whose output
+        is volts and whose input is volts or unspecified (blank). This excludes
+        the sensor stage (input is a ground-motion unit such as ``m/s``) and
+        the ADC stage (output is ``count``), so it yields the same set of
+        stages whether or not a sensor is prepended — i.e. identical values
+        when computed from a datalogger-only NRL file (index build) or from a
+        full sensor+datalogger response (detection). Returns ``None`` when no
+        such stage exists.
+        """
+        volts = ('V', 'VOLT', 'VOLTS')
+        gain = 1.0
+        found = False
+        for stage in response.response_stages[:adc_idx]:
+            in_u = str(getattr(stage, 'input_units', '') or '').upper()
+            out_u = str(getattr(stage, 'output_units', '') or '').upper()
+            if out_u in volts and (in_u in volts or in_u == ''):
+                g = getattr(stage, 'stage_gain', 1.0) or 1.0
+                gain *= float(g)
+                found = True
+        return gain if found else None
+
     def _compute_dl_sig_with_preamp(
         self, response: Response, adc_idx: int
     ) -> Optional[str]:
@@ -519,12 +545,9 @@ class NRLIndex:
         hasher = hashlib.sha256()
         hasher.update(b"dl_exact:")
 
-        if response.response_stages[0]:
-            preamp_gain = getattr(
-                response.response_stages[0], 'stage_gain', None
-            )
-            if preamp_gain:
-                hasher.update(f":pg={round(preamp_gain, 2)}".encode())
+        preamp_gain = self._datalogger_preamp_gain(response, adc_idx)
+        if preamp_gain is not None:
+            hasher.update(f":pg={round(preamp_gain, 2)}".encode())
 
         total_gain = self._compute_total_digital_gain(response, adc_idx)
         hasher.update(f":tg={round(total_gain, 2)}".encode())
@@ -661,10 +684,7 @@ class NRLIndex:
 
         adc_idx = self._find_adc_stage_index(response)
         if adc_idx is not None:
-            user_preamp_gain = self._find_preamp_gain(response, adc_idx)
-            exact_sig = self._compute_dl_sig_with_user_preamp(
-                response, adc_idx, user_preamp_gain
-            )
+            exact_sig = self._compute_dl_sig_with_preamp(response, adc_idx)
             if exact_sig and exact_sig in self._datalogger_signatures:
                 candidates = self._datalogger_signatures[exact_sig]
                 result.datalogger_candidates = candidates
@@ -699,80 +719,24 @@ class NRLIndex:
         return result
 
     def _find_adc_stage_index(self, response: Response) -> Optional[int]:
+        # The ADC is the analog-to-digital boundary: the first stage whose
+        # output is in COUNTS. Everything before it is analog (volts / physical
+        # units) and everything after it is digital (COUNTS -> COUNTS), so the
+        # output alone identifies it. We deliberately do NOT also require a "V"
+        # input, so a response that mislabels the ADC's input units (e.g.
+        # "M/S -> COUNTS" instead of "V -> COUNTS") is still recognised. For a
+        # well-formed response this returns the same stage as a strict
+        # V->COUNTS match, because no earlier stage outputs COUNTS.
         if not response or not response.response_stages:
             return None
 
         for i, stage in enumerate(response.response_stages):
-            in_units = getattr(stage, 'input_units', None)
             out_units = getattr(stage, 'output_units', None)
-
-            in_str = str(in_units).upper() if in_units else ""
             out_str = str(out_units).upper() if out_units else ""
-
-            is_volt_in = in_str in ('V', 'VOLT', 'VOLTS')
-            is_count_out = 'COUNT' in out_str
-
-            if is_volt_in and is_count_out:
+            if 'COUNT' in out_str:
                 return i
 
         return None
-
-    def _find_preamp_gain(
-        self, response: Response, adc_idx: int
-    ) -> Optional[float]:
-        if not response or adc_idx is None or adc_idx <= 1:
-            return None
-
-        preamp_gain = 1.0
-        found_preamp = False
-
-        for i in range(1, adc_idx):
-            stage = response.response_stages[i]
-            in_u = str(getattr(stage, 'input_units', '')).upper()
-            out_u = str(getattr(stage, 'output_units', '')).upper()
-
-            is_v_to_v = (in_u in ('V', 'VOLT', 'VOLTS') and
-                         out_u in ('V', 'VOLT', 'VOLTS'))
-
-            if is_v_to_v:
-                gain = getattr(stage, 'stage_gain', 1.0) or 1.0
-                preamp_gain *= float(gain)
-                found_preamp = True
-
-        return preamp_gain if found_preamp else None
-
-    def _compute_dl_sig_with_user_preamp(
-        self, response: Response, adc_idx: int,
-        user_preamp_gain: Optional[float]
-    ) -> Optional[str]:
-
-        if not response or not response.response_stages:
-            return None
-        if adc_idx >= len(response.response_stages):
-            return None
-
-        hasher = hashlib.sha256()
-        hasher.update(b"dl_exact:")
-
-        if user_preamp_gain is not None:
-            hasher.update(f":pg={round(user_preamp_gain, 2)}".encode())
-
-        total_gain = self._compute_total_digital_gain(response, adc_idx)
-        hasher.update(f":tg={round(total_gain, 2)}".encode())
-
-        fir_idx = 0
-        for stage in response.response_stages[adc_idx:]:
-            if self._is_passthrough_stage(stage):
-                continue
-            coeffs = self._get_fir_coefficients(stage)
-            if coeffs:
-                self._hash_fir_fingerprint(coeffs, hasher, f"f{fir_idx}")
-                dec = getattr(stage, 'decimation_factor', None)
-                if dec:
-                    hasher.update(f":dec={dec}".encode())
-                fir_idx += 1
-
-        return hasher.hexdigest()
 
     def _compute_datalogger_signature_from_response(
         self, response: Response

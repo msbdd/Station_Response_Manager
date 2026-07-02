@@ -13,6 +13,8 @@ from PyQt5.QtCore import QSettings
 from SRM_core.utils import (
     resource_path,
     convert_inventory_to_xml,
+    atomic_write_inventory,
+    count_channels_with_issues,
 )
 import os
 import sys
@@ -188,7 +190,7 @@ class MainWindow(QMainWindow):
             (
                 f"Saving {os.path.basename(fp)}...",
                 (lambda fp=fp, inv=inv:
-                 inv.write(fp, format="STATIONXML")),
+                 atomic_write_inventory(inv, fp, fmt="STATIONXML")),
             )
             for fp, inv in items
         ]
@@ -438,7 +440,7 @@ class MainWindow(QMainWindow):
         try:
             inv = Inventory(networks=[], source="Seismic Response Manager")
             self.loaded_files[filepath] = inv
-            inv.write(filepath, format="STATIONXML")
+            atomic_write_inventory(inv, filepath, fmt="STATIONXML")
             self.manager_tab.add_file_to_tree(filepath, inv)
             self.open_explorer_tab(filepath, inv)
             self.update_status_bar()
@@ -575,15 +577,23 @@ class MainWindow(QMainWindow):
         n_nets = 0
         n_stas = 0
         n_chans = 0
+        n_issues = 0
         for inv in self.loaded_files.values():
+            n_issues += count_channels_with_issues(inv)
             for net in inv.networks:
                 n_nets += 1
                 for sta in net.stations:
                     n_stas += 1
                     n_chans += len(sta.channels)
-        self._status_label.setText(
+        text = (
             f"{n_files} file{'s' if n_files != 1 else ''} | "
             f"{n_nets} network{'s' if n_nets != 1 else ''} | "
             f"{n_stas} station{'s' if n_stas != 1 else ''} | "
             f"{n_chans} channel{'s' if n_chans != 1 else ''}"
         )
+        if n_issues:
+            text += (
+                f"  ⚠ {n_issues} channel"
+                f"{'s' if n_issues != 1 else ''} with metadata issues"
+            )
+        self._status_label.setText(text)

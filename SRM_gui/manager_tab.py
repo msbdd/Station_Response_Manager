@@ -14,6 +14,7 @@ from PyQt5.QtWebEngineWidgets import QWebEngineView
 from PyQt5.QtGui import QColor, QBrush
 from PyQt5.QtCore import Qt, QTimer, QUrl
 from SRM_gui.timeline import TimelineWidget
+from SRM_core.utils import validate_response
 import json
 import colorsys
 from obspy import Inventory
@@ -21,6 +22,10 @@ from obspy.core.inventory import Station, Channel
 from obspy.core.inventory.response import Response
 import os
 from pathlib import Path
+
+# Amber used to flag channels/stations/networks with metadata validation issues
+# (distinct from the green sensor / blue digitizer detection annotations).
+_WARNING_COLOR = "#c77700"
 
 
 class ManagerTab(QWidget):
@@ -112,23 +117,39 @@ class ManagerTab(QWidget):
         )
         self.file_tree.addTopLevelItem(file_item)
 
+        file_has_issues = False
         for net in inventory.networks:
             net_item = QTreeWidgetItem([f"Network: {net.code}"])
             net_item.setData(0, Qt.UserRole, ("network", net))
             file_item.addChild(net_item)
+            net_has_issues = False
 
             for sta in net.stations:
                 sta_item = QTreeWidgetItem([f"Station: {sta.code}"])
                 sta_item.setData(0, Qt.UserRole, ("station", sta))
                 net_item.addChild(sta_item)
+                sta_has_issues = False
 
                 for chan in sta.channels:
                     chan_item = QTreeWidgetItem([f"Channel: {chan.code}"])
                     chan_item.setData(0, Qt.UserRole, ("channel", chan))
                     sta_item.addChild(chan_item)
                     self._add_instrument_detection(chan_item, chan)
+                    if self._add_validation_warnings(chan_item, chan):
+                        sta_has_issues = True
+
+                if sta_has_issues:
+                    self._tint_warning(sta_item)
+                    net_has_issues = True
 
                 file_item.setExpanded(True)
+
+            if net_has_issues:
+                self._tint_warning(net_item)
+                file_has_issues = True
+
+        if file_has_issues:
+            self._tint_warning(file_item)
 
         for net in inventory.networks:
             color = self.get_color_for_network(net.code)
@@ -227,6 +248,36 @@ class ManagerTab(QWidget):
                     tooltip += f"  ... and {remaining} more"
                 dl_item.setToolTip(0, tooltip)
             chan_item.addChild(dl_item)
+
+    def _add_validation_warnings(self, chan_item, channel):
+        """Attach an amber warning node listing metadata issues for this
+        channel's response. Returns True if any issue was found."""
+        if not channel.response:
+            return False
+        issues = validate_response(channel.response)
+        if not issues:
+            return False
+
+        n = len(issues)
+        warn_item = QTreeWidgetItem(
+            [f"⚠ {n} metadata issue{'s' if n != 1 else ''}"]
+        )
+        warn_item.setData(0, Qt.UserRole, ("validation", channel))
+        warn_item.setForeground(0, QBrush(QColor(_WARNING_COLOR)))
+        font = warn_item.font(0)
+        font.setItalic(True)
+        warn_item.setFont(0, font)
+        warn_item.setFlags(warn_item.flags() & ~Qt.ItemIsSelectable)
+        tooltip = "Metadata validation:\n" + "\n".join(
+            f"  • [{sev}] {msg}" for sev, msg in issues
+        )
+        warn_item.setToolTip(0, tooltip)
+        chan_item.addChild(warn_item)
+        self._tint_warning(chan_item)
+        return True
+
+    def _tint_warning(self, item):
+        item.setForeground(0, QBrush(QColor(_WARNING_COLOR)))
 
     def new_explorer_view(self):
         item = self.file_tree.currentItem()
