@@ -97,6 +97,7 @@ class ResponseTab(QWidget):
         self.explorer_tab = explorer_tab
         self.nrl_root = nrl_root
         self.undo_stack = []
+        self.redo_stack = []
         self._suppress_edits = False
         self._field_index = {}
         self._pz_index = {}
@@ -106,6 +107,15 @@ class ResponseTab(QWidget):
         self.undo_shortcut = QShortcut(QKeySequence.Undo, self)
         self.undo_shortcut.setContext(Qt.WidgetWithChildrenShortcut)
         self.undo_shortcut.activated.connect(self.undo)
+        # Explicit sequences instead of QKeySequence.Redo: on platforms
+        # where the standard redo is Ctrl+Y, binding both would register
+        # the same key twice and make the shortcut ambiguous (never fires).
+        self.redo_shortcut = QShortcut(QKeySequence("Ctrl+Y"), self)
+        self.redo_shortcut.setContext(Qt.WidgetWithChildrenShortcut)
+        self.redo_shortcut.activated.connect(self.redo)
+        self.redo_shortcut_alt = QShortcut(QKeySequence("Ctrl+Shift+Z"), self)
+        self.redo_shortcut_alt.setContext(Qt.WidgetWithChildrenShortcut)
+        self.redo_shortcut_alt.activated.connect(self.redo)
 
     def load_response_editor(self, response):
         self.selected_response = response
@@ -233,6 +243,7 @@ class ResponseTab(QWidget):
     def commit_baseline(self):
         self.original_response = deepcopy(self.selected_response)
         self.undo_stack.clear()
+        self.redo_stack.clear()
 
     def _apply_modified_style(self, item, modified):
         font = item.font(1)
@@ -1102,9 +1113,92 @@ class ResponseTab(QWidget):
     _UNDO_LIMIT = 100
 
     def _push_undo(self, op):
+        # A new user edit invalidates anything that was undone.
+        self.redo_stack.clear()
         self.undo_stack.append(op)
         if len(self.undo_stack) > self._UNDO_LIMIT:
             self.undo_stack = self.undo_stack[-self._UNDO_LIMIT:]
+
+    def _capture_forward(self, op):
+        # Save what _apply_reverse is about to destroy so redo can restore
+        # it (e.g. reversing add_pole pops and discards the pole).
+        tag = op[0]
+        if tag in ("edit", "delete_field"):
+            return getattr(op[1], op[2], None)
+        if tag == "edit_pole":
+            return op[1].poles[op[2]]
+        if tag == "edit_zero":
+            return op[1].zeros[op[2]]
+        if tag == "add_pole":
+            return op[1].poles[-1] if op[1].poles else None
+        if tag == "add_zero":
+            return op[1].zeros[-1] if op[1].zeros else None
+        if tag == "add_stage":
+            _, response, stage = op
+            stages = response.response_stages
+            return stages.index(stage) if stage in stages else len(stages)
+        if tag == "bulk_replace":
+            _, response, _stages, _sens = op
+            return (
+                response.response_stages,
+                response.instrument_sensitivity,
+            )
+        return None
+
+    def _apply_forward(self, op, captured):
+        tag = op[0]
+        if tag == "edit":
+            _, ref_object, attr, _old = op
+            setattr(ref_object, attr, captured)
+            return ("field", ref_object, attr, captured)
+        if tag == "edit_pole":
+            _, stage, index, _old = op
+            stage.poles[index] = captured
+            return ("pz", stage, "pole", index, captured)
+        if tag == "edit_zero":
+            _, stage, index, _old = op
+            stage.zeros[index] = captured
+            return ("pz", stage, "zero", index, captured)
+        if tag == "add_pole":
+            _, stage = op
+            if captured is not None:
+                stage.poles.append(captured)
+            return ("structural",)
+        if tag == "add_zero":
+            _, stage = op
+            if captured is not None:
+                stage.zeros.append(captured)
+            return ("structural",)
+        if tag == "add_stage":
+            _, response, stage = op
+            if stage not in response.response_stages:
+                response.response_stages.insert(captured, stage)
+                self._renumber_stages()
+            return ("structural",)
+        if tag == "delete_pole":
+            _, stage, index, _removed = op
+            del stage.poles[index]
+            return ("structural",)
+        if tag == "delete_zero":
+            _, stage, index, _removed = op
+            del stage.zeros[index]
+            return ("structural",)
+        if tag == "delete_stage":
+            _, response, removed, _index = op
+            if removed in response.response_stages:
+                response.response_stages.remove(removed)
+                self._renumber_stages()
+            return ("structural",)
+        if tag == "delete_field":
+            _, ref_object, attr, _old = op
+            setattr(ref_object, attr, None)
+            return ("structural",)
+        if tag == "bulk_replace":
+            _, response, _stages, _sens = op
+            response.response_stages = captured[0]
+            response.instrument_sensitivity = captured[1]
+            return ("structural",)
+        return ("structural",)
 
     def _apply_reverse(self, op):
         tag = op[0]
@@ -1166,7 +1260,9 @@ class ResponseTab(QWidget):
         op = self.undo_stack.pop()
         fast = False
         try:
+            captured = self._capture_forward(op)
             result = self._apply_reverse(op)
+            self.redo_stack.append((op, captured))
             if result[0] == "field":
                 _, ref_object, attr, value = result
                 fast = self._fast_update_field(ref_object, attr, value)
@@ -1185,6 +1281,33 @@ class ResponseTab(QWidget):
         else:
             self.load_response_editor(self.selected_response)
 
+    def redo(self):
+        if not self.redo_stack:
+            return
+        op, captured = self.redo_stack.pop()
+        fast = False
+        try:
+            result = self._apply_forward(op, captured)
+            # Append directly: _push_undo would clear the redo stack.
+            self.undo_stack.append(op)
+            if result[0] == "field":
+                _, ref_object, attr, value = result
+                fast = self._fast_update_field(ref_object, attr, value)
+            elif result[0] == "pz":
+                _, stage, kind, index, value = result
+                fast = self._fast_update_pz(stage, kind, index, value)
+        except Exception as e:
+            QMessageBox.warning(
+                self, "Redo Error", f"Failed to redo: {e}"
+            )
+        if fast:
+            if result[0] == "field":
+                self._sync_units_display(result[1], result[2])
+            self._refresh_validation_section()
+            self.plot_response(self.selected_response)
+        else:
+            self.load_response_editor(self.selected_response)
+
     def _revert_all(self):
         while self.undo_stack:
             op = self.undo_stack.pop()
@@ -1192,6 +1315,7 @@ class ResponseTab(QWidget):
                 self._apply_reverse(op)
             except Exception:
                 pass
+        self.redo_stack.clear()
 
     def _fast_update_field(self, ref_object, attr, value):
         item = self._field_index.get((id(ref_object), attr))

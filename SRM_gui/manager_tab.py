@@ -8,11 +8,16 @@ from PyQt5.QtWidgets import (
     QMessageBox,
     QSplitter,
     QHBoxLayout,
+    QFileDialog,
 )
 from copy import deepcopy
+from SRM_core.utils import atomic_write_inventory, make_export_inventory
 from PyQt5.QtWebEngineWidgets import QWebEngineView
+from PyQt5.QtWebChannel import QWebChannel
 from PyQt5.QtGui import QColor, QBrush
-from PyQt5.QtCore import Qt, QTimer, QUrl
+from PyQt5.QtCore import (
+    Qt, QTimer, QUrl, QObject, pyqtSignal, pyqtSlot,
+)
 from SRM_gui.timeline import TimelineWidget
 from SRM_gui.validation_ui import build_issue_items, tint_warning
 import json
@@ -22,6 +27,16 @@ from obspy.core.inventory import Station, Channel
 from obspy.core.inventory.response import Response
 import os
 from pathlib import Path
+
+
+class MapBridge(QObject):
+    """QWebChannel endpoint the Leaflet page calls on marker clicks."""
+
+    station_clicked = pyqtSignal(str, int, int)  # filepath, net_idx, sta_idx
+
+    @pyqtSlot(str, int, int)
+    def notify_station_clicked(self, filepath, net_idx, sta_idx):
+        self.station_clicked.emit(filepath, net_idx, sta_idx)
 
 
 class ManagerTab(QWidget):
@@ -61,6 +76,10 @@ class ManagerTab(QWidget):
         delete_btn.clicked.connect(self.delete_selected_item)
         btn_layout.addWidget(delete_btn)
 
+        export_btn = QPushButton("Export…")
+        export_btn.clicked.connect(self.export_selected_item)
+        btn_layout.addWidget(export_btn)
+
         new_view_btn = QPushButton("New View")
         new_view_btn.clicked.connect(self.new_explorer_view)
         btn_layout.addWidget(new_view_btn)
@@ -69,6 +88,17 @@ class ManagerTab(QWidget):
         splitter.addWidget(left_widget)
         self.right_tabs = QTabWidget()
         self.map_view = QWebEngineView()
+        # The channel must be installed before setHtml so the page script
+        # finds qt.webChannelTransport on load; keep bridge and channel on
+        # self or they get garbage-collected and clicks silently die.
+        self._syncing_from_map = False
+        self._map_bridge = MapBridge(self)
+        self._map_bridge.station_clicked.connect(
+            self._on_map_station_clicked
+        )
+        self._web_channel = QWebChannel(self.map_view.page())
+        self._web_channel.registerObject("bridge", self._map_bridge)
+        self.map_view.page().setWebChannel(self._web_channel)
         current_dir = Path(__file__)
         map_template_path = current_dir.parent / "map_template.html"
         with map_template_path.open("r", encoding="utf-8") as f:
@@ -147,21 +177,36 @@ class ManagerTab(QWidget):
         if file_has_issues:
             self._tint_warning(file_item)
 
-        for net in inventory.networks:
+        self.all_stations.extend(
+            self._station_markers_for_file(abs_filepath, inventory)
+        )
+        self._push_markers()
+        self.update_timeline()
+
+    def _station_markers_for_file(self, filepath, inventory):
+        # net_idx/sta_idx key the marker back to the tree by position —
+        # station codes may repeat across epochs, so codes are ambiguous.
+        markers = []
+        for net_idx, net in enumerate(inventory.networks):
             color = self.get_color_for_network(net.code)
-            for sta in net.stations:
-                self.all_stations.append(
+            for sta_idx, sta in enumerate(net.stations):
+                markers.append(
                     {
                         "name": f"{net.code}.{sta.code}",
                         "lat": sta.latitude,
                         "lon": sta.longitude,
                         "network": net.code,
                         "color": color,
+                        "file": filepath,
+                        "net_idx": net_idx,
+                        "sta_idx": sta_idx,
                     }
                 )
+        return markers
+
+    def _push_markers(self):
         js_code = f"addStations({json.dumps(self.all_stations)});"
         self.map_view.page().runJavaScript(js_code)
-        self.update_timeline()
 
     def _add_instrument_detection(self, chan_item, channel):
         if not channel.response:
@@ -284,6 +329,78 @@ class ManagerTab(QWidget):
             self.main_window.open_explorer_tab(
                 filepath=filepath, inventory=inventory, force_new=True
             )
+
+    def export_selected_item(self):
+        item = self.file_tree.currentItem()
+        data = item.data(0, Qt.UserRole) if item else None
+        if not data or data[0] not in (
+            "file", "network", "station", "channel"
+        ):
+            QMessageBox.warning(
+                self, "No Selection",
+                "Select a file, network, station, or channel to export."
+            )
+            return
+
+        type_, obj = data
+        network = station = inventory = None
+        if type_ == "file":
+            inventory = self.main_window.loaded_files.get(obj)
+            if inventory is None:
+                QMessageBox.warning(
+                    self, "Export Error", "File is not loaded."
+                )
+                return
+        elif type_ == "station":
+            net_data = item.parent().data(0, Qt.UserRole)
+            network = net_data[1]
+        elif type_ == "channel":
+            sta_item = item.parent()
+            station = sta_item.data(0, Qt.UserRole)[1]
+            network = sta_item.parent().data(0, Qt.UserRole)[1]
+
+        try:
+            export_inv, default_name = make_export_inventory(
+                type_, obj, network=network, station=station,
+                inventory=inventory,
+            )
+        except Exception as e:
+            QMessageBox.warning(
+                self, "Export Error", f"Cannot export this item:\n{e}"
+            )
+            return
+
+        target, _ = QFileDialog.getSaveFileName(
+            self, "Export StationXML", default_name,
+            "StationXML Files (*.xml);;All Files (*)",
+        )
+        if not target:
+            return
+
+        try:
+            resolved = str(Path(target).resolve())
+        except Exception:
+            resolved = target
+        if resolved in self.main_window.loaded_files:
+            reply = QMessageBox.question(
+                self, "Overwrite Loaded File",
+                "This file is currently loaded; Save All will overwrite "
+                "the exported copy again. Continue?",
+                QMessageBox.Yes | QMessageBox.No, QMessageBox.No,
+            )
+            if reply != QMessageBox.Yes:
+                return
+
+        try:
+            atomic_write_inventory(export_inv, target, fmt="STATIONXML")
+        except Exception as e:
+            QMessageBox.warning(
+                self, "Export Error", f"Failed to export:\n{e}"
+            )
+            return
+        QMessageBox.information(
+            self, "Export Complete", f"Exported to:\n{target}"
+        )
 
     def handle_item_double_click(self, item, column):
         data = item.data(0, Qt.UserRole)
@@ -505,7 +622,40 @@ class ManagerTab(QWidget):
                 "Network, or Station.",
             )
 
+    def _on_map_station_clicked(self, filepath, net_idx, sta_idx):
+        for i in range(self.file_tree.topLevelItemCount()):
+            file_item = self.file_tree.topLevelItem(i)
+            data = file_item.data(0, Qt.UserRole)
+            if not (data and data[0] == "file" and data[1] == filepath):
+                continue
+            if net_idx < file_item.childCount():
+                net_item = file_item.child(net_idx)
+                if sta_idx < net_item.childCount():
+                    # Leaflet already opened the popup on the click; the
+                    # guard keeps handle_selection_changed from re-centering
+                    # the map for this map-originated selection.
+                    self._syncing_from_map = True
+                    try:
+                        self._focus_tree_item(net_item.child(sta_idx))
+                    finally:
+                        self._syncing_from_map = False
+            return
+
+    def _marker_key_for_item(self, sta_item):
+        net_item = sta_item.parent()
+        file_item = net_item.parent() if net_item else None
+        data = file_item.data(0, Qt.UserRole) if file_item else None
+        if not data or data[0] != "file":
+            return None
+        return "{}|{}|{}".format(
+            data[1],
+            file_item.indexOfChild(net_item),
+            net_item.indexOfChild(sta_item),
+        )
+
     def handle_selection_changed(self):
+        if self._syncing_from_map:
+            return
         selected_items = self.file_tree.selectedItems()
         if not selected_items:
             return
@@ -515,9 +665,11 @@ class ManagerTab(QWidget):
         if data and data[0] == "station":
             sta = data[1]
             try:
-                lat = sta.latitude
-                lon = sta.longitude
-                js = f"focusOnStation({lat}, {lon}, 10);"
+                key = self._marker_key_for_item(item)
+                if key is not None:
+                    js = f"highlightStation({json.dumps(key)});"
+                else:
+                    js = f"focusOnStation({sta.latitude}, {sta.longitude});"
                 self.map_view.page().runJavaScript(js)
             except Exception:
                 pass
@@ -567,19 +719,11 @@ class ManagerTab(QWidget):
         # edit in the file tree (new / paste / delete), which otherwise leave
         # these views stale.
         self.all_stations = []
-        for inventory in self.main_window.loaded_files.values():
-            for net in inventory.networks:
-                color = self.get_color_for_network(net.code)
-                for sta in net.stations:
-                    self.all_stations.append({
-                        "name": f"{net.code}.{sta.code}",
-                        "lat": sta.latitude,
-                        "lon": sta.longitude,
-                        "network": net.code,
-                        "color": color,
-                    })
-        js_code = f"addStations({json.dumps(self.all_stations)});"
-        self.map_view.page().runJavaScript(js_code)
+        for filepath, inventory in self.main_window.loaded_files.items():
+            self.all_stations.extend(
+                self._station_markers_for_file(filepath, inventory)
+            )
+        self._push_markers()
         self.update_timeline()
         self.main_window.update_status_bar()
 

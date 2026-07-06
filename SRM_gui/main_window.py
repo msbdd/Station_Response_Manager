@@ -29,6 +29,7 @@ from SRM_gui.manager_tab import ManagerTab
 from SRM_gui.explorer_tab import ExplorerTab
 from SRM_gui.response_tab import ResponseTab
 from SRM_gui.dialogs import StationInventoryWizard, ImportFromMiniSEEDDialog
+from SRM_gui.review_dialog import ReviewChangesDialog
 
 
 class MainWindow(QMainWindow):
@@ -102,6 +103,10 @@ class MainWindow(QMainWindow):
         add_data.setShortcut("Ctrl+O")
         add_data.triggered.connect(self.add_data)
         file_menu.addAction(add_data)
+        review_changes = QAction("Review Changes…", self)
+        review_changes.setShortcut("Ctrl+E")
+        review_changes.triggered.connect(self.review_changes)
+        file_menu.addAction(review_changes)
         save_all = QAction("Save All Files", self)
         save_all.setShortcut("Ctrl+S")
         save_all.triggered.connect(self.save_all_files)
@@ -180,10 +185,27 @@ class MainWindow(QMainWindow):
         )
         dialog.exec_()
 
-    def save_all_files(self):
+    def review_changes(self):
+        if not self.loaded_files:
+            QMessageBox.information(
+                self, "Review Changes", "No files loaded."
+            )
+            return
+        dialog = ReviewChangesDialog(self.loaded_files, parent=self)
+        if dialog.exec_() == QDialog.Accepted:
+            self.save_all_files(review=False)
+
+    def save_all_files(self, *, review=True):
         items = list(self.loaded_files.items())
         if not items:
             return
+
+        # Show pending changes before writing anything; the dialog's
+        # "Save All" accepts, "Close" aborts the save.
+        if review and self.has_unsaved_changes():
+            dialog = ReviewChangesDialog(self.loaded_files, parent=self)
+            if dialog.exec_() != QDialog.Accepted:
+                return
 
         failed_paths = set()
         jobs = [
@@ -210,6 +232,7 @@ class MainWindow(QMainWindow):
                     if key[1] in failed_paths:
                         continue
                     widget.undo_stack.clear()
+                    widget.redo_stack.clear()
                     widget._baseline_snapshot = {}
                     widget.populate_tree(widget.current_inventory)
                 elif (key[0] == "response"
@@ -424,7 +447,10 @@ class MainWindow(QMainWindow):
                 event.ignore()
                 return
             if reply == QMessageBox.Save:
-                self.save_all_files()
+                # Skip the review dialog here: event.accept() below runs
+                # unconditionally, so rejecting a review would otherwise
+                # close the app with the changes silently discarded.
+                self.save_all_files(review=False)
         event.accept()
 
     def create_new_inventory(self):

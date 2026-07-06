@@ -51,6 +51,7 @@ class ExplorerTab(QWidget):
         self.main_window = main_window
         self.current_inventory = None
         self.undo_stack = []
+        self.redo_stack = []
         self._suppress_edits = False
         self._item_index = {}
         self._baseline_snapshot = {}
@@ -100,6 +101,12 @@ class ExplorerTab(QWidget):
         self.undo_shortcut = QShortcut(QKeySequence.Undo, self)
         self.undo_shortcut.setContext(Qt.WidgetWithChildrenShortcut)
         self.undo_shortcut.activated.connect(self.undo)
+        self.redo_shortcut = QShortcut(QKeySequence("Ctrl+Y"), self)
+        self.redo_shortcut.setContext(Qt.WidgetWithChildrenShortcut)
+        self.redo_shortcut.activated.connect(self.redo)
+        self.redo_shortcut_alt = QShortcut(QKeySequence("Ctrl+Shift+Z"), self)
+        self.redo_shortcut_alt.setContext(Qt.WidgetWithChildrenShortcut)
+        self.redo_shortcut_alt.activated.connect(self.redo)
 
     def navigate_to(
         self, net_code, sta_code, chan_code,
@@ -848,6 +855,8 @@ class ExplorerTab(QWidget):
     _UNDO_LIMIT = 100
 
     def _push_undo(self, op):
+        # A new user edit invalidates anything that was undone.
+        self.redo_stack.clear()
         self.undo_stack.append(op)
         if len(self.undo_stack) > self._UNDO_LIMIT:
             self.undo_stack = self.undo_stack[-self._UNDO_LIMIT:]
@@ -886,19 +895,84 @@ class ExplorerTab(QWidget):
             return ("field", obj, attr, old_value)
         return ("structural",)
 
+    def _capture_forward(self, op):
+        # Save what _apply_reverse is about to destroy so redo can restore
+        # it. Structural ops already carry the object and index.
+        if op[0] in ("edit", "add_field", "delete_field"):
+            return getattr(op[1], op[2], None)
+        return None
+
+    def _apply_forward(self, op, captured):
+        tag = op[0]
+        if tag == "edit":
+            _, ref_object, attr, _old = op
+            setattr(ref_object, attr, captured)
+            return ("field", ref_object, attr, captured)
+        if tag == "add_station":
+            _, network, station = op
+            if station not in network.stations:
+                network.stations.append(station)
+            return ("structural",)
+        if tag == "add_channel":
+            _, station, channel = op
+            if channel not in station.channels:
+                station.channels.append(channel)
+            return ("structural",)
+        if tag == "add_field":
+            # Structural: the field row has to (re)appear in the tree.
+            _, obj, attr, _prev = op
+            setattr(obj, attr, captured)
+            return ("structural",)
+        if tag == "delete_station":
+            _, network, station, _index = op
+            if station in network.stations:
+                network.stations.remove(station)
+            return ("structural",)
+        if tag == "delete_channel":
+            _, station, channel, _index = op
+            if channel in station.channels:
+                station.channels.remove(channel)
+            return ("structural",)
+        if tag == "delete_field":
+            _, obj, attr, _old = op
+            setattr(obj, attr, None)
+            return ("structural",)
+        return ("structural",)
+
     def undo(self):
         if not self.undo_stack:
             return
         op = self.undo_stack.pop()
         fast = False
         try:
+            captured = self._capture_forward(op)
             result = self._apply_reverse(op)
+            self.redo_stack.append((op, captured))
             if result[0] == "field":
                 _, ref_object, attr, value = result
                 fast = self._fast_update_item(ref_object, attr, value)
         except Exception as e:
             QMessageBox.warning(
                 self, "Undo Error", f"Failed to undo: {e}"
+            )
+        if not fast:
+            self.populate_tree(self.current_inventory)
+
+    def redo(self):
+        if not self.redo_stack:
+            return
+        op, captured = self.redo_stack.pop()
+        fast = False
+        try:
+            result = self._apply_forward(op, captured)
+            # Append directly: _push_undo would clear the redo stack.
+            self.undo_stack.append(op)
+            if result[0] == "field":
+                _, ref_object, attr, value = result
+                fast = self._fast_update_item(ref_object, attr, value)
+        except Exception as e:
+            QMessageBox.warning(
+                self, "Redo Error", f"Failed to redo: {e}"
             )
         if not fast:
             self.populate_tree(self.current_inventory)
@@ -910,6 +984,7 @@ class ExplorerTab(QWidget):
                 self._apply_reverse(op)
             except Exception:
                 pass
+        self.redo_stack.clear()
 
     def _fast_update_item(self, ref_object, attr, value):
         item = self._item_index.get((id(ref_object), attr))

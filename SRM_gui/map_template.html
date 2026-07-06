@@ -11,16 +11,31 @@
             height: 100%;
             margin: 0; padding: 0;
         }
+        /* Popups are info-only labels: let clicks pass through so an
+           open popup never blocks clicking the markers underneath it
+           (station clusters sit closer together than a popup is wide). */
+        .leaflet-popup-pane,
+        .leaflet-popup-pane * {
+            pointer-events: none !important;
+        }
     </style>
 </head>
 <body>
 
 <div id="map"></div>
 
+<script src="qrc:///qtwebchannel/qwebchannel.js"></script>
 <script src="leaflet/leaflet.js"></script>
 
 <script>
-    var map = L.map('map').setView([0, 0], 2);
+    var map = L.map('map', {doubleClickZoom: false}).setView([0, 0], 2);
+
+    var bridge = null;
+    if (typeof QWebChannel !== 'undefined' && typeof qt !== 'undefined') {
+        new QWebChannel(qt.webChannelTransport, function(channel) {
+            bridge = channel.objects.bridge;
+        });
+    }
 
     var CachedTileLayer = L.TileLayer.extend({
         createTile: function(coords, done) {
@@ -55,12 +70,15 @@
     }).addTo(map);
 
     var stationLayer = L.layerGroup().addTo(map);
+    var markersByKey = {};
 
     function addStations(stations) {
         stationLayer.clearLayers();
+        markersByKey = {};
         stations.forEach(function(station) {
             var marker = L.marker([station.lat, station.lon], {
                 title: station.name,
+                keyboard: false,
                 icon: L.divIcon({
                     className: 'triangle-icon',
                     html: `<div style="color: ${station.color}; font-size: 40px;">&#9650;</div>`,
@@ -68,13 +86,34 @@
                     iconAnchor: [20, 40],
                 })
             });
-            marker.bindPopup('<b>' + station.name + '</b><br>Network: ' + station.network);
+            marker.bindPopup(
+                '<b>' + station.name + '</b><br>Network: ' + station.network,
+                {closeButton: false}
+            );
+            if (station.file !== undefined) {
+                var key = station.file + '|' + station.net_idx + '|' + station.sta_idx;
+                markersByKey[key] = marker;
+                marker.on('click', function() {
+                    if (bridge) {
+                        bridge.notify_station_clicked(
+                            station.file, station.net_idx, station.sta_idx
+                        );
+                    }
+                });
+            }
             stationLayer.addLayer(marker);
         });
     }
 
     function focusOnStation(lat, lon, zoom=10) {
         map.setView([lat, lon], zoom);
+    }
+
+    function highlightStation(key, zoom=10) {
+        var marker = markersByKey[key];
+        if (!marker) return;
+        map.setView(marker.getLatLng(), zoom, {animate: false});
+        marker.openPopup();
     }
 </script>
 

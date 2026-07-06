@@ -1,6 +1,9 @@
 # core/parser.py
-from copy import deepcopy
+from copy import copy, deepcopy
 from obspy import read_inventory
+from obspy import Inventory
+import difflib
+import io
 import os
 import sys
 import re
@@ -152,6 +155,102 @@ def convert_inventory_to_xml(input_path: str, output_path: str):
     except Exception as e:
         error_message = f"An error occurred during conversion.\n\nDetails: {e}"
         return False, error_message
+
+
+def make_export_inventory(item_type, obj, network=None, station=None,
+                          inventory=None,
+                          source="Station Response Manager"):
+    """Return (Inventory, default_filename) containing only the selected
+    node.
+
+    ``item_type`` is one of "file" | "network" | "station" | "channel";
+    ``network``/``station`` are the parent ObsPy objects for station and
+    channel exports; ``inventory`` is the full Inventory (with its display
+    name in ``obj``) when ``item_type`` is "file".
+
+    Parent containers are shallow-copied with their child list *reassigned*
+    (never mutated), so the live inventory is untouched and the leaf
+    objects are shared, which is safe because ``Inventory.write`` does not
+    mutate them.
+    """
+    if item_type == "file":
+        name = os.path.basename(str(obj))
+        if not name.lower().endswith(".xml"):
+            name = os.path.splitext(name)[0] + ".xml"
+        return inventory, name
+    if item_type == "network":
+        return (
+            Inventory(networks=[obj], source=source),
+            f"{obj.code}.xml",
+        )
+    if item_type == "station":
+        net_copy = copy(network)
+        net_copy.stations = [obj]
+        return (
+            Inventory(networks=[net_copy], source=source),
+            f"{network.code}.{obj.code}.xml",
+        )
+    if item_type == "channel":
+        sta_copy = copy(station)
+        sta_copy.channels = [obj]
+        net_copy = copy(network)
+        net_copy.stations = [sta_copy]
+        parts = [network.code, station.code]
+        if obj.location_code:
+            parts.append(obj.location_code)
+        parts.append(obj.code)
+        return (
+            Inventory(networks=[net_copy], source=source),
+            ".".join(parts) + ".xml",
+        )
+    raise ValueError(f"Cannot export item of type {item_type!r}")
+
+
+# Header lines that differ between serializations without reflecting a
+# real metadata change.
+_VOLATILE_XML_TAGS = ("<Created>", "<Module>", "<ModuleURI>")
+
+
+def inventory_to_stationxml_lines(inventory):
+    """Serialize to StationXML text lines, dropping volatile header
+    lines so two serializations of equal inventories compare equal."""
+    buf = io.BytesIO()
+    inventory.write(buf, format="STATIONXML")
+    # Objects built in memory serialize slightly differently from ones
+    # that passed through the reader (e.g. a plain-float SampleRate has
+    # no unit attribute), so round-trip once and serialize the fixed
+    # point the reader normalizes to.
+    try:
+        buf.seek(0)
+        normalized = read_inventory(buf)
+        buf = io.BytesIO()
+        normalized.write(buf, format="STATIONXML")
+    except Exception:
+        pass
+    return [
+        line for line in buf.getvalue().decode("utf-8").splitlines()
+        if not any(tag in line for tag in _VOLATILE_XML_TAGS)
+    ]
+
+
+def diff_inventory_vs_file(path, inventory):
+    """Unified diff of the in-memory ``inventory`` against the file at
+    ``path``, both serialized through the same StationXML writer so
+    formatting differences cancel out. Returns "" when identical and an
+    explanatory message when the on-disk baseline cannot be read."""
+    try:
+        baseline = read_inventory(path)
+    except Exception as e:
+        return f"! Could not read on-disk baseline:\n! {e}"
+    name = os.path.basename(path)
+    diff = difflib.unified_diff(
+        inventory_to_stationxml_lines(baseline),
+        inventory_to_stationxml_lines(inventory),
+        fromfile=f"{name} (on disk)",
+        tofile=f"{name} (edited)",
+        lineterm="",
+    )
+    return "\n".join(diff)
 
 
 def _units_equal(a, b):

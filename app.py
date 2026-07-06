@@ -1,6 +1,11 @@
 import sys
 import os
-from PyQt5.QtWidgets import QApplication
+
+if os.environ.get("XDG_SESSION_TYPE") == "wayland" \
+        and not os.environ.get("QT_QPA_PLATFORM"):
+    os.environ["QT_QPA_PLATFORM"] = "xcb"
+
+from PyQt5.QtWidgets import QApplication  # noqa: E402
 from PyQt5.QtGui import QIcon, QPalette, QColor
 from PyQt5.QtCore import QSettings
 from SRM_core.utils import resource_path
