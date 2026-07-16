@@ -44,6 +44,18 @@ def _editable_attrs(obj):
     return names
 
 
+def _identity_index(seq, obj):
+    """Index of ``obj`` in ``seq`` by identity, or None.
+
+    ObsPy inventory objects compare by attribute equality, so ``list.index``
+    / ``remove`` can hit an equal twin — e.g. two epochs of the same channel
+    code. Structural edits must always target the exact object."""
+    for i, x in enumerate(seq):
+        if x is obj:
+            return i
+    return None
+
+
 class ExplorerTab(QWidget):
     def __init__(self, filepath, main_window):
         super().__init__()
@@ -235,6 +247,11 @@ class ExplorerTab(QWidget):
             if ref and isinstance(ref, tuple) and ref[0] == "station":
                 return ref[1]
         elif label.startswith("Channel: "):
+            ref = header_item.data(0, Qt.UserRole)
+            if ref and isinstance(ref, tuple) and ref[0] == "channel":
+                return ref[1]
+            # Fallback for items without a ref: match by code. Ambiguous
+            # when epochs share a code — the stored ref above avoids that.
             sta_header = header_item.parent()
             if sta_header:
                 sta_ref = sta_header.data(0, Qt.UserRole)
@@ -657,20 +674,24 @@ class ExplorerTab(QWidget):
             )
             if reply != QMessageBox.Yes:
                 return
-            net_code = net_label.replace("Network: ", "").strip()
-            for net in self.current_inventory.networks:
-                if net.code == net_code and sta in net.stations:
-                    idx = net.stations.index(sta)
-                    net.stations.remove(sta)
+            net_ref = net_item.data(0, Qt.UserRole)
+            if net_ref and net_ref[0] == "network":
+                net = net_ref[1]
+                idx = _identity_index(net.stations, sta)
+                if idx is not None:
+                    del net.stations[idx]
                     self._push_undo(
                         ("delete_station", net, sta, idx)
                     )
-                    break
             self.populate_tree(self.current_inventory)
             return
 
         # Delete a Channel
         if label.startswith("Channel: "):
+            ref = item.data(0, Qt.UserRole)
+            if not ref or ref[0] != "channel":
+                return
+            chan = ref[1]
             sta_item = item.parent()
             if not sta_item:
                 return
@@ -678,11 +699,8 @@ class ExplorerTab(QWidget):
             if not sta_ref or sta_ref[0] != "station":
                 return
             sta = sta_ref[1]
-            chan_code = label.replace("Channel: ", "").strip()
-            chan = next(
-                (c for c in sta.channels if c.code == chan_code), None
-            )
-            if not chan:
+            idx = _identity_index(sta.channels, chan)
+            if idx is None:
                 return
             reply = QMessageBox.question(
                 self, "Delete Channel",
@@ -691,8 +709,7 @@ class ExplorerTab(QWidget):
             )
             if reply != QMessageBox.Yes:
                 return
-            idx = sta.channels.index(chan)
-            sta.channels.remove(chan)
+            del sta.channels[idx]
             self._push_undo(("delete_channel", sta, chan, idx))
             self.populate_tree(self.current_inventory)
             return
@@ -865,13 +882,15 @@ class ExplorerTab(QWidget):
             return ("field", ref_object, attr, old_value)
         if tag == "add_station":
             _, network, station = op
-            if station in network.stations:
-                network.stations.remove(station)
+            idx = _identity_index(network.stations, station)
+            if idx is not None:
+                del network.stations[idx]
             return ("structural",)
         if tag == "add_channel":
             _, station, channel = op
-            if channel in station.channels:
-                station.channels.remove(channel)
+            idx = _identity_index(station.channels, channel)
+            if idx is not None:
+                del station.channels[idx]
             return ("structural",)
         if tag == "add_field":
             _, obj, attr, prev_value = op
@@ -906,12 +925,12 @@ class ExplorerTab(QWidget):
             return ("field", ref_object, attr, captured)
         if tag == "add_station":
             _, network, station = op
-            if station not in network.stations:
+            if _identity_index(network.stations, station) is None:
                 network.stations.append(station)
             return ("structural",)
         if tag == "add_channel":
             _, station, channel = op
-            if channel not in station.channels:
+            if _identity_index(station.channels, channel) is None:
                 station.channels.append(channel)
             return ("structural",)
         if tag == "add_field":
@@ -921,13 +940,15 @@ class ExplorerTab(QWidget):
             return ("structural",)
         if tag == "delete_station":
             _, network, station, _index = op
-            if station in network.stations:
-                network.stations.remove(station)
+            idx = _identity_index(network.stations, station)
+            if idx is not None:
+                del network.stations[idx]
             return ("structural",)
         if tag == "delete_channel":
             _, station, channel, _index = op
-            if channel in station.channels:
-                station.channels.remove(channel)
+            idx = _identity_index(station.channels, channel)
+            if idx is not None:
+                del station.channels[idx]
             return ("structural",)
         if tag == "delete_field":
             _, obj, attr, _old = op

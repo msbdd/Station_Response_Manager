@@ -24,12 +24,28 @@ from pathlib import Path
 from obspy.clients.nrl import NRL
 from SRM_core.nrl_index import NRLIndex
 from SRM_gui.index_progress_dialog import IndexProgressDialog
-from SRM_gui.io_progress import IOProgressDialog
+from SRM_gui.io_progress import IOProgressDialog, IOSummary
 from SRM_gui.manager_tab import ManagerTab
 from SRM_gui.explorer_tab import ExplorerTab
 from SRM_gui.response_tab import ResponseTab
 from SRM_gui.dialogs import StationInventoryWizard, ImportFromMiniSEEDDialog
 from SRM_gui.review_dialog import ReviewChangesDialog
+
+
+def save_outcome(items, failed_paths, summary):
+    """What a Save All run actually achieved.
+
+    Returns ``(saved_paths, fully_saved)``: the paths whose job ran without
+    error, and whether every file was written. Jobs skipped by a cancel are
+    neither saved nor failed — they must keep their unsaved state.
+    """
+    saved_paths = {
+        items[i][0] for i in summary.completed
+    } - set(failed_paths)
+    fully_saved = (
+        len(summary.completed) == len(items) and not failed_paths
+    )
+    return saved_paths, fully_saved
 
 
 class MainWindow(QMainWindow):
@@ -178,7 +194,7 @@ class MainWindow(QMainWindow):
     def _run_jobs(self, title, jobs, on_result, on_done=None):
         if not jobs:
             if on_done is not None:
-                on_done()
+                on_done(IOSummary(completed=set(), canceled=False))
             return
         dialog = IOProgressDialog(
             title, jobs, on_result, on_done, parent=self
@@ -225,11 +241,15 @@ class MainWindow(QMainWindow):
                     self, "Error", f"Failed to save {fp}:\n{error}"
                 )
 
-        def on_done():
-            self._manager_dirty = False
+        def on_done(summary):
+            saved_paths, fully_saved = save_outcome(
+                items, failed_paths, summary
+            )
+            if fully_saved:
+                self._manager_dirty = False
             for key, widget in self.open_tabs.items():
                 if key[0] == "explorer" and isinstance(widget, ExplorerTab):
-                    if key[1] in failed_paths:
+                    if key[1] not in saved_paths:
                         continue
                     widget.undo_stack.clear()
                     widget.redo_stack.clear()
@@ -240,14 +260,21 @@ class MainWindow(QMainWindow):
                     tab_path = getattr(
                         widget.explorer_tab, "filepath", None
                     )
-                    if tab_path and tab_path not in failed_paths:
+                    if tab_path and tab_path in saved_paths:
                         widget.commit_baseline()
 
             self.manager_tab.refresh()
-            if not failed_paths:
+            if fully_saved:
                 QMessageBox.information(
                     self, "Save Complete",
                     "All inventories saved successfully.",
+                )
+            elif summary.canceled:
+                QMessageBox.warning(
+                    self, "Save Cancelled",
+                    f"Save cancelled — {len(saved_paths)} of {len(items)} "
+                    "files saved. The remaining files still have unsaved "
+                    "changes.",
                 )
 
         self._run_jobs("Saving files", jobs, on_result, on_done)
@@ -288,7 +315,7 @@ class MainWindow(QMainWindow):
             self.loaded_files[path] = inv
             self.manager_tab.add_file_to_tree(path, inv)
 
-        def on_done():
+        def on_done(_summary):
             self.update_status_bar()
 
         self._run_jobs("Loading files", jobs, on_result, on_done)

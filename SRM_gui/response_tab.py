@@ -147,13 +147,10 @@ class ResponseTab(QWidget):
         left_widget = QWidget()
         left_layout = QVBoxLayout(left_widget)
 
+        self._sens_label = None
         if response.instrument_sensitivity:
-            sens = response.instrument_sensitivity
-            left_layout.addWidget(
-                QLabel(
-                    f"<b>Sensitivity:</b> {sens.value} @ {sens.frequency} Hz"
-                )
-            )
+            self._sens_label = QLabel(self._sens_label_text())
+            left_layout.addWidget(self._sens_label)
 
         self.stage_tree = QTreeWidget()
         self.stage_tree.setHeaderLabels(["Field", "Value"])
@@ -265,6 +262,19 @@ class ResponseTab(QWidget):
         self.original_response = deepcopy(self.selected_response)
         self.undo_stack.clear()
         self.redo_stack.clear()
+
+    def _sens_label_text(self):
+        sens = self.selected_response.instrument_sensitivity
+        return f"<b>Sensitivity:</b> {sens.value} @ {sens.frequency} Hz"
+
+    def _refresh_sens_label(self):
+        """The header label duplicates the sensitivity tree fields; keep it
+        in step on inline edits and undo/redo, which skip the full editor
+        rebuild."""
+        if (self._sens_label is not None
+                and self.selected_response.instrument_sensitivity
+                is not None):
+            self._sens_label.setText(self._sens_label_text())
 
     def _apply_modified_style(self, item, modified):
         modified = bool(modified)
@@ -620,6 +630,7 @@ class ResponseTab(QWidget):
                 self._suppress_edits = False
 
             self._sync_units_display(ref_object, attr)
+            self._refresh_sens_label()
             self._refresh_validation_section()
             self.plot_response(self.selected_response)
 
@@ -1431,6 +1442,7 @@ class ResponseTab(QWidget):
             )
         finally:
             self._suppress_edits = False
+        self._refresh_sens_label()
         return True
 
     def _fast_update_pz(self, stage, kind, index, value):

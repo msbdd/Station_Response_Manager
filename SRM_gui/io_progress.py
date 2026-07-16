@@ -1,7 +1,15 @@
+from collections import namedtuple
+
 from PyQt5.QtWidgets import (
     QDialog, QVBoxLayout, QLabel, QProgressBar, QPushButton,
 )
 from PyQt5.QtCore import Qt, QThread, pyqtSignal
+
+# Outcome of a job batch, passed to the dialog's on_done callback.
+# ``completed`` holds the indices of jobs that ran (successfully or not —
+# per-job errors go through on_result); jobs skipped by a cancel are
+# absent, so callers must not treat them as done.
+IOSummary = namedtuple("IOSummary", ["completed", "canceled"])
 
 
 class _IOWorker(QThread):
@@ -12,6 +20,7 @@ class _IOWorker(QThread):
     def __init__(self, jobs):
         super().__init__()
         self.jobs = jobs
+        self.completed = set()
         self._canceled = False
 
     def cancel(self):
@@ -28,6 +37,7 @@ class _IOWorker(QThread):
                 self.item_done.emit(i, result, None)
             except Exception as e:
                 self.item_done.emit(i, None, e)
+            self.completed.add(i)
         self.finished_all.emit()
 
 
@@ -102,8 +112,12 @@ class IOProgressDialog(QDialog):
         self.activity_bar.setValue(1)
         self.cancel_btn.setEnabled(False)
         if self._on_done is not None:
+            summary = IOSummary(
+                completed=set(self.worker.completed),
+                canceled=self.worker._canceled,
+            )
             try:
-                self._on_done()
+                self._on_done(summary)
             except Exception:
                 pass
         self.accept()
