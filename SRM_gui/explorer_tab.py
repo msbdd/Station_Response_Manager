@@ -380,6 +380,7 @@ class ExplorerTab(QWidget):
         return current != baseline
 
     def _apply_modified_style(self, item, modified):
+        modified = bool(modified)
         font = item.font(1)
         font.setBold(modified)
         item.setFont(1, font)
@@ -852,14 +853,9 @@ class ExplorerTab(QWidget):
             item.setExpanded(True)
         return visible
 
-    _UNDO_LIMIT = 100
-
     def _push_undo(self, op):
-        # A new user edit invalidates anything that was undone.
         self.redo_stack.clear()
         self.undo_stack.append(op)
-        if len(self.undo_stack) > self._UNDO_LIMIT:
-            self.undo_stack = self.undo_stack[-self._UNDO_LIMIT:]
 
     def _apply_reverse(self, op):
         tag = op[0]

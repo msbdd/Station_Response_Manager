@@ -27,6 +27,7 @@ from SRM_core.utils import (
     wrap_text,
     natural_sort_key,
     validate_response,
+    stage_gain_product,
 )
 import os
 import copy
@@ -52,6 +53,22 @@ from obspy.clients.nrl import NRL
 _BASELINE_ROLE = Qt.UserRole + 1
 
 _UNIT_ATTRS = ("input_units", "output_units")
+
+# Attribute types for fields whose current value is None: the type can't be
+# inferred from the old value then, and falling through to str would store
+# text in a numeric field (breaking evalresp and serialization).
+_FLOAT_ATTRS = (
+    "value",
+    "frequency",
+    "stage_gain",
+    "stage_gain_frequency",
+    "normalization_factor",
+    "normalization_frequency",
+    "decimation_input_sample_rate",
+    "decimation_delay",
+    "decimation_correction",
+)
+_INT_ATTRS = ("decimation_factor", "decimation_offset")
 
 
 def _units_label(stage):
@@ -159,6 +176,10 @@ class ResponseTab(QWidget):
         replace_button.clicked.connect(self.replace_response)
         btn_layout.addWidget(replace_button)
 
+        recalc_btn = QPushButton("Recalculate Sensitivity")
+        recalc_btn.clicked.connect(self.recalculate_sensitivity)
+        btn_layout.addWidget(recalc_btn)
+
         save_btn = QPushButton("Revert Response")
         save_btn.clicked.connect(self.revert_response)
         btn_layout.addWidget(save_btn)
@@ -246,6 +267,7 @@ class ResponseTab(QWidget):
         self.redo_stack.clear()
 
     def _apply_modified_style(self, item, modified):
+        modified = bool(modified)
         font = item.font(1)
         font.setBold(modified)
         item.setFont(1, font)
@@ -578,6 +600,10 @@ class ResponseTab(QWidget):
             elif attr in _UNIT_ATTRS:
                 # Unit fields are plain strings; blank means "not set".
                 new_value = new_text.strip() or None
+            elif old_value is None and attr in _FLOAT_ATTRS:
+                new_value = float(new_text) if new_text.strip() else None
+            elif old_value is None and attr in _INT_ATTRS:
+                new_value = int(new_text) if new_text.strip() else None
             else:
                 new_value = new_text
 
@@ -706,6 +732,67 @@ class ResponseTab(QWidget):
             QMessageBox.information(
                 self, "Success", "Response updated."
             )
+
+    def recalculate_sensitivity(self):
+        """Recompute the overall instrument sensitivity from the stage
+        chain. Never triggered automatically: a stated sensitivity may come
+        from a calibration sheet, so replacing it is the user's call."""
+        response = getattr(self, "selected_response", None)
+        sens = response.instrument_sensitivity if response else None
+        if sens is None:
+            QMessageBox.information(
+                self, "Recalculate Sensitivity",
+                "This response has no instrument sensitivity to "
+                "recalculate."
+            )
+            return
+        old_value = sens.value
+        old_frequency = sens.frequency
+        note = None
+        try:
+            response.recalculate_overall_sensitivity()
+            # ObsPy returns numpy scalars; keep builtin floats so Qt and
+            # serialization never see numpy types.
+            sens.value = float(sens.value)
+            if sens.frequency is not None:
+                sens.frequency = float(sens.frequency)
+        except ValueError:
+            # ObsPy only supports input units it can map to a ground-motion
+            # quantity; fall back to the stage gain product for the rest.
+            product = stage_gain_product(response.response_stages)
+            if product is None:
+                QMessageBox.warning(
+                    self, "Recalculate Sensitivity",
+                    "Cannot recalculate: the input units are not supported "
+                    "by the exact method and some stage gains are missing "
+                    "or zero."
+                )
+                return
+            sens.value = product
+            note = (
+                f"Input units '{sens.input_units}' are not supported by "
+                "the exact recalculation; the stage gain product was used "
+                "instead."
+            )
+        except Exception as e:
+            QMessageBox.warning(
+                self, "Recalculate Sensitivity",
+                f"Failed to recalculate sensitivity: {e}"
+            )
+            return
+        if sens.value == old_value and sens.frequency == old_frequency:
+            QMessageBox.information(
+                self, "Recalculate Sensitivity",
+                "The sensitivity already matches the stage chain."
+            )
+            return
+        self._push_undo(("edit_many", [
+            (sens, "value", old_value),
+            (sens, "frequency", old_frequency),
+        ]))
+        self.load_response_editor(response)
+        if note:
+            QMessageBox.information(self, "Recalculate Sensitivity", note)
 
     def new(self):
         item = self.stage_tree.currentItem()
@@ -1125,6 +1212,8 @@ class ResponseTab(QWidget):
         tag = op[0]
         if tag in ("edit", "delete_field"):
             return getattr(op[1], op[2], None)
+        if tag == "edit_many":
+            return [getattr(obj, attr, None) for obj, attr, _old in op[1]]
         if tag == "edit_pole":
             return op[1].poles[op[2]]
         if tag == "edit_zero":
@@ -1151,6 +1240,10 @@ class ResponseTab(QWidget):
             _, ref_object, attr, _old = op
             setattr(ref_object, attr, captured)
             return ("field", ref_object, attr, captured)
+        if tag == "edit_many":
+            for (obj, attr, _old), value in zip(op[1], captured):
+                setattr(obj, attr, value)
+            return ("structural",)
         if tag == "edit_pole":
             _, stage, index, _old = op
             stage.poles[index] = captured
@@ -1206,6 +1299,10 @@ class ResponseTab(QWidget):
             _, ref_object, attr, old_value = op
             setattr(ref_object, attr, old_value)
             return ("field", ref_object, attr, old_value)
+        if tag == "edit_many":
+            for obj, attr, old_value in op[1]:
+                setattr(obj, attr, old_value)
+            return ("structural",)
         if tag == "edit_pole":
             _, stage, index, old_val = op
             stage.poles[index] = old_val
@@ -1309,12 +1406,16 @@ class ResponseTab(QWidget):
             self.load_response_editor(self.selected_response)
 
     def _revert_all(self):
-        while self.undo_stack:
-            op = self.undo_stack.pop()
-            try:
-                self._apply_reverse(op)
-            except Exception:
-                pass
+        # Restore from the deepcopy baseline instead of replaying the undo
+        # stack: the stack is capped at _UNDO_LIMIT, so replaying it could
+        # silently leave the earliest edits applied on discard.
+        self.response.response_stages = deepcopy(
+            self.original_response.response_stages
+        )
+        self.response.instrument_sensitivity = deepcopy(
+            self.original_response.instrument_sensitivity
+        )
+        self.undo_stack.clear()
         self.redo_stack.clear()
 
     def _fast_update_field(self, ref_object, attr, value):

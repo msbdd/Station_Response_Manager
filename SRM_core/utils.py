@@ -4,7 +4,9 @@ from obspy import read_inventory
 from obspy import Inventory
 import difflib
 import io
+import logging
 import os
+import stat
 import sys
 import re
 import tempfile
@@ -12,7 +14,34 @@ import colorsys
 from datetime import datetime, timezone as _tz
 
 
+logger = logging.getLogger(__name__)
+
 _VOLT_UNITS = ('V', 'VOLT', 'VOLTS')
+
+# Relative divergence between the stated overall sensitivity and the stage
+# gain product above which validation warns (evalresp uses the same 5%).
+SENS_TOLERANCE = 0.05
+
+
+def stage_gain_product(stages):
+    """Product of all stage gains, or None if any stage lacks a usable
+    non-zero gain — a partial product would be misleading.
+
+    This is the first-order estimate of the overall sensitivity: it ignores
+    the frequency dependence between the individual gain frequencies, but
+    catches order-of-magnitude errors without running evalresp.
+    """
+    product = 1.0
+    for s in stages:
+        gain = getattr(s, 'stage_gain', None)
+        try:
+            gain = float(gain)
+        except (TypeError, ValueError):
+            return None
+        if gain == 0:
+            return None
+        product *= gain
+    return product
 
 
 def _norm_unit(units):
@@ -81,7 +110,31 @@ def combine_resp(sensor_resp, recorder_resp):
         try:
             result.recalculate_overall_sensitivity()
         except ValueError:
-            pass
+            # ObsPy can only recalculate for input units it can map to a
+            # ground-motion quantity (DISP/VEL/ACC). For anything else
+            # (e.g. PA for infrasound) fall back to the stage gain product
+            # — keeping the datalogger-only value would be orders of
+            # magnitude wrong.
+            product = stage_gain_product(result.response_stages)
+            if product is not None:
+                sens.value = product
+                for s in result.response_stages:
+                    freq = getattr(s, 'normalization_frequency', None)
+                    if freq:
+                        sens.frequency = float(freq)
+                        break
+                logger.warning(
+                    "Overall sensitivity for input units '%s' cannot be "
+                    "recalculated exactly; using the stage gain product "
+                    "%g instead.", sens.input_units, product
+                )
+            else:
+                logger.warning(
+                    "Overall sensitivity could not be recalculated (input "
+                    "units '%s' unsupported and some stage gains are "
+                    "missing); the combined value %s may be wrong.",
+                    sens.input_units, sens.value
+                )
     return result
 
 
@@ -133,6 +186,20 @@ def atomic_write_inventory(inventory, path, fmt="STATIONXML"):
     os.close(fd)
     try:
         inventory.write(tmp_path, format=fmt)
+        # mkstemp creates the file 0600; carry over the destination's
+        # permissions (or the umask default for a new file) so saving
+        # never strips group/world access.
+        try:
+            mode = stat.S_IMODE(os.stat(path).st_mode)
+        except OSError:
+            mask = os.umask(0)
+            os.umask(mask)
+            mode = 0o666 & ~mask
+        os.chmod(tmp_path, mode)
+        # Flush data to disk before the rename so a power loss cannot
+        # leave an empty file under the original name.
+        with open(tmp_path, 'rb') as f:
+            os.fsync(f.fileno())
         os.replace(tmp_path, path)
     except Exception:
         try:
@@ -322,6 +389,21 @@ def validate_response(response):
                 "warning",
                 f"Sensitivity output units '{sens.output_units}' "
                 f"don't match last stage output '{last_out}'."
+            ))
+        # Cross-check the stated value against the stage gain product so a
+        # sensitivity left stale after stage edits doesn't go unnoticed.
+        computed = stage_gain_product(stages)
+        if (computed is not None
+                and isinstance(sens.value, (int, float))
+                and sens.value
+                and abs(sens.value - computed)
+                > SENS_TOLERANCE * abs(computed)):
+            issues.append((
+                "warning",
+                f"Stated sensitivity {sens.value:g} differs from the "
+                f"stage gain product {computed:g} by more than "
+                f"{SENS_TOLERANCE:.0%}. Recalculate it if the stages "
+                f"are correct."
             ))
 
     # Check for stages with zero gain

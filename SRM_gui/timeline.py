@@ -23,6 +23,7 @@ from SRM_core.utils import (
 )
 from fnmatch import fnmatch
 from datetime import datetime, timezone as _tz
+import os
 
 
 def _match(pattern, full_id, has_wildcards):
@@ -685,11 +686,15 @@ class TimelineWidget(QWidget):
         return [r for r in rows if r['group'] in visible_groups]
 
     def group_stations(self, loaded_files):
+        # Group by (NET.STA, filepath): the same code appearing in two
+        # loaded files must stay two groups, or every row would inherit
+        # the first file's path and double-click would open the wrong
+        # file. Duplicate stations *within* one file still merge.
         groups = {}
         for fp, inv in loaded_files.items():
             for net in inv.networks:
                 for sta in net.stations:
-                    key = f"{net.code}.{sta.code}"
+                    key = (f"{net.code}.{sta.code}", fp)
                     groups.setdefault(key, []).append(
                         (sta, net.code, fp)
                     )
@@ -700,18 +705,29 @@ class TimelineWidget(QWidget):
         color_idx = 0
         now_ts = datetime.now(tz=_tz.utc).timestamp()
 
-        for sta_key in sorted(groups.keys()):
-            entries = groups[sta_key]
+        # A code present in more than one file needs the file name in the
+        # label to stay distinguishable.
+        code_file_count = {}
+        for code, _fp in groups:
+            code_file_count[code] = code_file_count.get(code, 0) + 1
+
+        for group_key in sorted(groups.keys()):
+            sta_key, sta_filepath = group_key
+            entries = groups[group_key]
             base = BASE_COLORS[
                 color_idx % len(BASE_COLORS)
             ]
             color_idx += 1
 
+            sta_label = sta_key
+            if code_file_count[sta_key] > 1:
+                sta_label = (
+                    f"{sta_key} [{os.path.basename(sta_filepath)}]"
+                )
+
             sta_segs = []
             prev_params = None
             seg_idx = 0
-            # Use first entry's filepath for this group
-            sta_filepath = entries[0][2]
             for sta, net_code, _fp in sorted(
                 entries,
                 key=lambda e: utc_to_ts(
@@ -759,10 +775,10 @@ class TimelineWidget(QWidget):
                 })
 
             rows.append({
-                'label': sta_key,
+                'label': sta_label,
                 'segments': sta_segs,
                 'kind': 'station',
-                'group': sta_key,
+                'group': group_key,
                 'full_id': sta_key,
                 'filepath': sta_filepath,
             })
@@ -828,7 +844,7 @@ class TimelineWidget(QWidget):
                     'label': f"  {loc}.{code}",
                     'segments': segs,
                     'kind': 'channel',
-                    'group': sta_key,
+                    'group': group_key,
                     'full_id': f"{sta_key}.{loc}.{code}",
                     'filepath': sta_filepath,
                 })
