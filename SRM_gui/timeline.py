@@ -10,10 +10,10 @@ from PyQt5.QtWidgets import (
     QGraphicsRectItem,
     QGraphicsSimpleTextItem,
     QGraphicsLineItem,
-    QToolTip,
+    QLabel,
 )
 from PyQt5.QtGui import QColor, QFont, QBrush, QPen, QTransform
-from PyQt5.QtCore import Qt, QTimer, pyqtSignal
+from PyQt5.QtCore import Qt, QTimer, QEvent, pyqtSignal
 from SRM_core.utils import (
     utc_to_ts,
     ts_to_label,
@@ -23,6 +23,7 @@ from SRM_core.utils import (
 )
 from fnmatch import fnmatch
 from datetime import datetime, timezone as _tz
+import html
 import os
 
 
@@ -36,10 +37,113 @@ def _match(pattern, full_id, has_wildcards):
     return pattern in full_id
 
 
-class _BarItem(QGraphicsRectItem):
-    # A single bar in the timeline with tooltip
+def _fmt_val(v):
+    return "—" if v is None else html.escape(str(v))
 
-    def __init__(self, x, y, w, h, color, tooltip, parent=None):
+
+def _to_html(text):
+    # Tooltips render as Qt rich text (the diff section needs tags for
+    # bold and the separator), and rich text collapses \n and double
+    # spaces — convert the plain parameter block accordingly.
+    return (html.escape(text)
+            .replace("\n", "<br>")
+            .replace("  ", "&nbsp;&nbsp;"))
+
+
+def _diff_section(prev_fields, cur_fields):
+    """Tooltip lines for fields that changed vs the previous epoch.
+
+    Fields are (label, value, unit) triples in fixed order; returns []
+    for the first epoch or when nothing changed."""
+    if prev_fields is None:
+        return []
+    lines = []
+    for (label, old, unit), (_lbl, new, _u) in zip(prev_fields, cur_fields):
+        if old == new:
+            continue
+        suffix = f" {unit}" if unit else ""
+        lines.append(
+            f"{label}: {_fmt_val(old)} → <b>{_fmt_val(new)}</b>{suffix}"
+        )
+    return lines
+
+
+def _with_diff(tip, prev_fields, cur_fields):
+    """HTML tooltip: the parameter block plus a set-apart section of the
+    fields that changed vs the previous epoch."""
+    tip = _to_html(tip)
+    changes = _diff_section(prev_fields, cur_fields)
+    if changes:
+        tip += ("<hr><b>Changed vs previous epoch</b><br>"
+                + "<br>".join(changes))
+    return tip
+
+
+class _HoverCard(QLabel):
+    """In-app replacement for QToolTip.
+
+    Desktop environments auto-expire native tooltip windows no matter
+    what msecShowTime is passed to QToolTip.showText; a plain child
+    widget is outside their reach and stays up for as long as the bar
+    under the cursor is hovered."""
+
+    _OFFSET = 14  # px away from the cursor
+
+    def __init__(self, parent):
+        super().__init__(parent)
+        self.setTextFormat(Qt.RichText)
+        # Let mouse events fall through: if the card ever sits under the
+        # cursor it must not steal the hover from the bar beneath it,
+        # which would hide the card and flicker.
+        self.setAttribute(Qt.WA_TransparentForMouseEvents)
+        self._apply_theme()
+        self.hide()
+
+    def _apply_theme(self):
+        # Concrete colors keyed off the app theme. The widget palette is
+        # unreliable here: style-sheet palette() has no toolTip* roles
+        # (invalid roles are dropped silently, leaving the card
+        # transparent) and the style-sheet engine restores its cached
+        # palette on re-polish, undoing direct setPalette calls.
+        if is_dark_theme():
+            bg, fg, bd = "#3c3c3c", "#e6e6e6", "#5a5a5a"
+        else:
+            bg, fg, bd = "#ffffdc", "#202020", "#b0b0b0"
+        sheet = (
+            "QLabel {"
+            f" background-color: {bg};"
+            f" color: {fg};"
+            f" border: 1px solid {bd};"
+            " padding: 4px 6px;"
+            "}"
+        )
+        # Setting a stylesheet feeds back into the widget palette; only
+        # re-set when it actually changed to avoid recursing.
+        if sheet != self.styleSheet():
+            self.setStyleSheet(sheet)
+
+    def changeEvent(self, event):
+        # Follow live theme switches.
+        if event.type() == QEvent.PaletteChange:
+            self._apply_theme()
+        super().changeEvent(event)
+
+    def show_at(self, global_pos, text):
+        self.setText(text)
+        self.adjustSize()
+        parent = self.parentWidget()
+        pos = parent.mapFromGlobal(global_pos)
+        x = min(pos.x() + self._OFFSET, parent.width() - self.width())
+        y = min(pos.y() + self._OFFSET, parent.height() - self.height())
+        self.move(max(x, 0), max(y, 0))
+        self.raise_()
+        self.show()
+
+
+class _BarItem(QGraphicsRectItem):
+    # A single bar in the timeline; hover shows the owner's info card
+
+    def __init__(self, x, y, w, h, color, tooltip, owner, parent=None):
         super().__init__(x, y, w, h, parent)
         qc = QColor(color)
         qc.setAlpha(220)
@@ -50,14 +154,13 @@ class _BarItem(QGraphicsRectItem):
         self.setPen(pen)
         self.setAcceptHoverEvents(True)
         self._tip = tooltip
+        self._owner = owner  # TimelineWidget
 
     def hoverEnterEvent(self, event):
-        QToolTip.showText(
-            event.screenPos(), self._tip
-        )
+        self._owner.hover_card.show_at(event.screenPos(), self._tip)
 
     def hoverLeaveEvent(self, event):
-        QToolTip.hideText()
+        self._owner.hover_card.hide()
 
 
 class TimelineView(QGraphicsView):
@@ -168,6 +271,9 @@ class TimelineWidget(QWidget):
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(0)
 
+        # Floating child (not in the layout); bars show it on hover.
+        self.hover_card = _HoverCard(self)
+
         ctrl = QHBoxLayout()
         ctrl.setContentsMargins(4, 2, 4, 0)
         self.btn_zin = QPushButton("T+")
@@ -276,6 +382,7 @@ class TimelineWidget(QWidget):
         self.label_view.setBackgroundBrush(brush)
         self.view.setBackgroundBrush(brush)
         self.axis_view.setBackgroundBrush(brush)
+        self.hover_card._apply_theme()
 
     def sync_labels(self):
         if not self.view.scene() or not hasattr(self, '_rows'):
@@ -727,6 +834,7 @@ class TimelineWidget(QWidget):
 
             sta_segs = []
             prev_params = None
+            prev_fields = None
             seg_idx = 0
             for sta, net_code, _fp in sorted(
                 entries,
@@ -769,6 +877,14 @@ class TimelineWidget(QWidget):
                     f"{ts_to_label(s)} \u2192 "
                     f"{ts_to_label(e)}"
                 )
+                cur_fields = [
+                    ("Lat", sta.latitude, ""),
+                    ("Lon", sta.longitude, ""),
+                    ("Elev", sta.elevation, "m"),
+                    ("Channels", len(sta.channels), ""),
+                ]
+                tip = _with_diff(tip, prev_fields, cur_fields)
+                prev_fields = cur_fields
                 sta_segs.append({
                     'start': s, 'end': e,
                     'color': color, 'tooltip': tip,
@@ -797,6 +913,7 @@ class TimelineWidget(QWidget):
                 chan_map.items()
             ):
                 segs = []
+                prev_fields = None
                 epoch_list.sort(
                     key=lambda x: utc_to_ts(
                         x[0].start_date
@@ -825,17 +942,33 @@ class TimelineWidget(QWidget):
                         f"{ts_to_label(s)} \u2192 "
                         f"{ts_to_label(e)}"
                     )
-                    if (
-                        ch.response
+                    sens = (
+                        ch.response.instrument_sensitivity
+                        if ch.response
                         and ch.response.instrument_sensitivity
-                    ):
-                        sens = (
-                            ch.response.instrument_sensitivity
-                        )
+                        else None
+                    )
+                    if sens:
                         tip += (
                             f"\nSensitivity: {sens.value}"
                             f" {sens.input_units}"
                         )
+                    cur_fields = [
+                        ("Lat", ch.latitude, ""),
+                        ("Lon", ch.longitude, ""),
+                        ("Depth", ch.depth, "m"),
+                        ("Sample rate", ch.sample_rate, "Hz"),
+                        ("Azimuth", ch.azimuth, "°"),
+                        ("Dip", ch.dip, "°"),
+                        (
+                            "Sensitivity",
+                            f"{sens.value} {sens.input_units}"
+                            if sens else None,
+                            "",
+                        ),
+                    ]
+                    tip = _with_diff(tip, prev_fields, cur_fields)
+                    prev_fields = cur_fields
                     segs.append({
                         'start': s, 'end': e,
                         'color': seg_c, 'tooltip': tip,
@@ -851,6 +984,8 @@ class TimelineWidget(QWidget):
         return rows
 
     def draw(self, rows, t_min, span):
+        # Rebuilding the bars strands the card if the cursor was on one.
+        self.hover_card.hide()
         rh = self.ROW_H
         px_per_sec = 800.0 / span
         self._pps = px_per_sec
@@ -896,6 +1031,6 @@ class TimelineWidget(QWidget):
 
                 bar = _BarItem(
                     x, y_bar, w, h,
-                    seg['color'], seg['tooltip'],
+                    seg['color'], seg['tooltip'], self,
                 )
                 self.scene.addItem(bar)

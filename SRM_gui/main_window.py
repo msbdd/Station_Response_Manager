@@ -56,9 +56,6 @@ class MainWindow(QMainWindow):
 
         self.loaded_files = {}
         self.open_tabs = {}
-        # Set when Manager-tab structural edits mutate in-memory inventories
-        # (those edits have no undo stack of their own). Cleared on Save All.
-        self._manager_dirty = False
 
         self.nrl_root = resource_path(os.path.join("resources", "NRL"))
         while True:
@@ -246,7 +243,8 @@ class MainWindow(QMainWindow):
                 items, failed_paths, summary
             )
             if fully_saved:
-                self._manager_dirty = False
+                self.manager_tab.undo_stack.clear()
+                self.manager_tab.redo_stack.clear()
             for key, widget in self.open_tabs.items():
                 if key[0] == "explorer" and isinstance(widget, ExplorerTab):
                     if key[1] not in saved_paths:
@@ -453,7 +451,7 @@ class MainWindow(QMainWindow):
                     t.populate_tree(t.current_inventory)
 
     def has_unsaved_changes(self):
-        if self._manager_dirty:
+        if self.manager_tab.undo_stack:
             return True
         for widget in self.open_tabs.values():
             if (isinstance(widget, (ExplorerTab, ResponseTab))

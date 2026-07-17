@@ -9,15 +9,17 @@ from PyQt5.QtWidgets import (
     QSplitter,
     QHBoxLayout,
     QFileDialog,
+    QShortcut,
 )
 from copy import deepcopy
 from SRM_core.utils import atomic_write_inventory, make_export_inventory
 from PyQt5.QtWebEngineWidgets import QWebEngineView
 from PyQt5.QtWebChannel import QWebChannel
-from PyQt5.QtGui import QColor, QBrush
+from PyQt5.QtGui import QColor, QBrush, QKeySequence
 from PyQt5.QtCore import (
     Qt, QTimer, QUrl, QObject, pyqtSignal, pyqtSlot,
 )
+from SRM_gui.explorer_tab import _identity_index
 from SRM_gui.timeline import TimelineWidget
 from SRM_gui.validation_ui import build_issue_items, tint_warning
 import json
@@ -46,6 +48,8 @@ class ManagerTab(QWidget):
 
         layout = QHBoxLayout(self)
         self.clipboard_item = None
+        self.undo_stack = []
+        self.redo_stack = []
         splitter = QSplitter(Qt.Horizontal)
         left_widget = QWidget()
         left_layout = QVBoxLayout(left_widget)
@@ -120,6 +124,16 @@ class ManagerTab(QWidget):
         splitter.setStretchFactor(0, 1)
         splitter.setStretchFactor(1, 2)
         layout.addWidget(splitter)
+
+        self.undo_shortcut = QShortcut(QKeySequence.Undo, self)
+        self.undo_shortcut.setContext(Qt.WidgetWithChildrenShortcut)
+        self.undo_shortcut.activated.connect(self.undo)
+        self.redo_shortcut = QShortcut(QKeySequence("Ctrl+Y"), self)
+        self.redo_shortcut.setContext(Qt.WidgetWithChildrenShortcut)
+        self.redo_shortcut.activated.connect(self.redo)
+        self.redo_shortcut_alt = QShortcut(QKeySequence("Ctrl+Shift+Z"), self)
+        self.redo_shortcut_alt.setContext(Qt.WidgetWithChildrenShortcut)
+        self.redo_shortcut_alt.activated.connect(self.redo)
 
     def get_color_for_network(self, network_name):
         if network_name not in self.network_colors:
@@ -445,11 +459,13 @@ class ManagerTab(QWidget):
         if type_ == "station" and target_data[0] == "network":
             station_copy = deepcopy(obj)
             target_data[1].stations.append(station_copy)
+            self._push_undo(("add_station", target_data[1], station_copy))
             pasted_item = self._add_station_to_tree(target_item, station_copy)
 
         elif type_ == "channel" and target_data[0] == "station":
             chan_copy = deepcopy(obj)
             target_data[1].channels.append(chan_copy)
+            self._push_undo(("add_channel", target_data[1], chan_copy))
             pasted_item = self._add_channel_to_tree(target_item, chan_copy)
 
         elif type_ == "network" and target_data[0] == "file":
@@ -457,6 +473,7 @@ class ManagerTab(QWidget):
             inv = self.main_window.loaded_files.get(target_data[1])
             if inv:
                 inv.networks.append(net_copy)
+                self._push_undo(("add_network", inv, net_copy))
                 pasted_item = self._add_network_to_tree(target_item, net_copy)
 
         else:
@@ -501,18 +518,31 @@ class ManagerTab(QWidget):
         if reply != QMessageBox.Yes:
             return
 
+        # Delete by identity, not list.remove(): ObsPy objects compare by
+        # value, so remove() could hit an equal twin (e.g. two epochs of
+        # the same station code).
         if type_ == "station":
             net_data = parent.data(0, Qt.UserRole)
             if net_data and net_data[0] == "network":
-                net_data[1].stations.remove(obj)
-                parent.removeChild(item)
-                self._mark_changed()
+                idx = _identity_index(net_data[1].stations, obj)
+                if idx is not None:
+                    del net_data[1].stations[idx]
+                    self._push_undo(
+                        ("delete_station", net_data[1], obj, idx)
+                    )
+                    parent.removeChild(item)
+                    self._mark_changed()
         elif type_ == "channel":
             sta_data = parent.data(0, Qt.UserRole)
             if sta_data and sta_data[0] == "station":
-                sta_data[1].channels.remove(obj)
-                parent.removeChild(item)
-                self._mark_changed()
+                idx = _identity_index(sta_data[1].channels, obj)
+                if idx is not None:
+                    del sta_data[1].channels[idx]
+                    self._push_undo(
+                        ("delete_channel", sta_data[1], obj, idx)
+                    )
+                    parent.removeChild(item)
+                    self._mark_changed()
 
     def _add_network_to_tree(self, file_item, net):
         net_item = QTreeWidgetItem([f"Network: {net.code}"])
@@ -576,6 +606,7 @@ class ManagerTab(QWidget):
             from obspy.core.inventory import Network
             net = Network(code="XX")
             inventory.networks.append(net)
+            self._push_undo(("add_network", inventory, net))
             new_item = self._add_network_to_tree(selected_item, net)
             selected_item.setExpanded(True)
             self._focus_tree_item(new_item)
@@ -587,6 +618,7 @@ class ManagerTab(QWidget):
                 code="STA", latitude=0.0, longitude=0.0, elevation=0.0
             )
             net.stations.append(sta)
+            self._push_undo(("add_station", net, sta))
             new_item = self._add_station_to_tree(selected_item, sta)
             selected_item.setExpanded(True)
             self._focus_tree_item(new_item)
@@ -609,6 +641,7 @@ class ManagerTab(QWidget):
             chan.response = Response()
 
             sta.channels.append(chan)
+            self._push_undo(("add_channel", sta, chan))
             new_item = self._add_channel_to_tree(selected_item, chan)
             selected_item.setExpanded(True)
             self._focus_tree_item(new_item)
@@ -727,7 +760,71 @@ class ManagerTab(QWidget):
         self.update_timeline()
         self.main_window.update_status_bar()
 
+    def _push_undo(self, op):
+        self.redo_stack.clear()
+        self.undo_stack.append(op)
+
+    def _op_list(self, op):
+        # Ops are (tag, parent, obj[, idx]); the tag suffix names which
+        # child list of parent was mutated.
+        kind = op[0].split("_", 1)[1]
+        return getattr(op[1], kind + "s")
+
+    def _apply_reverse(self, op):
+        seq, obj = self._op_list(op), op[2]
+        if op[0].startswith("add_"):
+            idx = _identity_index(seq, obj)
+            if idx is not None:
+                del seq[idx]
+        else:
+            # delete_* — re-insert where it was so tree positions keep
+            # matching inventory indices (map markers key by position).
+            seq.insert(op[3], obj)
+
+    def _apply_forward(self, op):
+        seq, obj = self._op_list(op), op[2]
+        if op[0].startswith("add_"):
+            if _identity_index(seq, obj) is None:
+                seq.append(obj)
+        else:
+            idx = _identity_index(seq, obj)
+            if idx is not None:
+                del seq[idx]
+
+    def undo(self):
+        if not self.undo_stack:
+            return
+        op = self.undo_stack.pop()
+        try:
+            self._apply_reverse(op)
+            self.redo_stack.append(op)
+        except Exception as e:
+            QMessageBox.warning(
+                self, "Undo Error", f"Failed to undo: {e}"
+            )
+        self._after_history_change()
+
+    def redo(self):
+        if not self.redo_stack:
+            return
+        op = self.redo_stack.pop()
+        try:
+            self._apply_forward(op)
+            # Append directly: _push_undo would clear the redo stack.
+            self.undo_stack.append(op)
+        except Exception as e:
+            QMessageBox.warning(
+                self, "Redo Error", f"Failed to redo: {e}"
+            )
+        self._after_history_change()
+
+    def _after_history_change(self):
+        # refresh() rebuilds the tree, map markers and timeline, but not
+        # the status bar.
+        self.refresh()
+        self.main_window.update_status_bar()
+
     def _mark_changed(self):
-        # Flag in-memory edits as unsaved and refresh dependent views.
-        self.main_window._manager_dirty = True
+        # Refresh dependent views after a structural edit; unsaved state
+        # is tracked by the undo stack (see has_unsaved_changes).
         self._refresh_side_views()
