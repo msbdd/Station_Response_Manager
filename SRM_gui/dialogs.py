@@ -16,6 +16,7 @@ from PyQt5.QtWidgets import (
     QFileDialog,
 )
 from PyQt5.QtCore import QDateTime
+from copy import deepcopy
 from SRM_core.utils import wrap_text, atomic_write_inventory
 import os
 from obspy import Inventory, UTCDateTime, read
@@ -380,7 +381,7 @@ class StationInventoryWizard(QDialog):
                     dip=dip,
                     sample_rate=rate,
                     start_date=start_date,
-                    response=response,
+                    response=deepcopy(response),
                 )
             )
         return channels

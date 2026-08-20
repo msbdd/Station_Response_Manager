@@ -1,9 +1,12 @@
+import logging
 from collections import namedtuple
 
 from PyQt5.QtWidgets import (
     QDialog, QVBoxLayout, QLabel, QProgressBar, QPushButton,
 )
 from PyQt5.QtCore import Qt, QThread, pyqtSignal
+
+logger = logging.getLogger(__name__)
 
 # Outcome of a job batch, passed to the dialog's on_done callback.
 # ``completed`` holds the indices of jobs that ran (successfully or not —
@@ -102,7 +105,10 @@ class IOProgressDialog(QDialog):
         try:
             self._on_result(idx, result, error)
         except Exception:
-            pass
+            # Swallow so one bad callback doesn't kill the batch, but
+            # never silently: a failure here can leave caller state
+            # (undo stacks, baselines) half-updated.
+            logger.exception("on_result callback failed for job %d", idx)
         if self.overall_bar is not None:
             self.overall_bar.setValue(idx + 1)
 
@@ -119,5 +125,5 @@ class IOProgressDialog(QDialog):
             try:
                 self._on_done(summary)
             except Exception:
-                pass
+                logger.exception("on_done callback failed")
         self.accept()

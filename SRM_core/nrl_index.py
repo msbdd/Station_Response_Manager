@@ -238,7 +238,9 @@ class NRLIndex:
                     ]
 
             return True
-        except (json.JSONDecodeError, IOError, KeyError) as e:
+        except (json.JSONDecodeError, IOError, KeyError, TypeError) as e:
+            # TypeError: InstrumentInfo(**info) on schema drift — a
+            # stale/corrupt index must trigger a rebuild, not a crash.
             logger.error("Error loading NRL index: %s", e)
             return False
 

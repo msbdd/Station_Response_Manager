@@ -472,10 +472,18 @@ class MainWindow(QMainWindow):
                 event.ignore()
                 return
             if reply == QMessageBox.Save:
-                # Skip the review dialog here: event.accept() below runs
-                # unconditionally, so rejecting a review would otherwise
-                # close the app with the changes silently discarded.
+                # Skip the review dialog here: rejecting a review would
+                # otherwise close the app with the changes silently
+                # discarded.
                 self.save_all_files(review=False)
+                if self.has_unsaved_changes():
+                    # A failed or cancelled save already showed its own
+                    # warning; refuse to exit so nothing is lost.
+                    self.statusBar().showMessage(
+                        "Exit cancelled — unsaved changes remain.", 5000
+                    )
+                    event.ignore()
+                    return
         event.accept()
 
     def create_new_inventory(self):
@@ -488,10 +496,14 @@ class MainWindow(QMainWindow):
         if not filepath:
             return
 
+        # Same key format as the load flow, so duplicate detection works.
+        filepath = str(Path(filepath).resolve())
         try:
             inv = Inventory(networks=[], source="Seismic Response Manager")
-            self.loaded_files[filepath] = inv
+            # Write first: registering a file whose write failed would
+            # leave a phantom loaded_files entry with no tree node.
             atomic_write_inventory(inv, filepath, fmt="STATIONXML")
+            self.loaded_files[filepath] = inv
             self.manager_tab.add_file_to_tree(filepath, inv)
             self.open_explorer_tab(filepath, inv)
             self.update_status_bar()

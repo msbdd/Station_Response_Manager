@@ -38,6 +38,7 @@ from matplotlib.backends.backend_qt5agg import (
 from matplotlib.figure import Figure
 import numpy as np
 from obspy import read_inventory
+from SRM_gui.explorer_tab import _identity_index
 from obspy.core.inventory.response import (
     ResponseStage,
     PolesZerosResponseStage,
@@ -1217,6 +1218,24 @@ class ResponseTab(QWidget):
         if len(self.undo_stack) > self._UNDO_LIMIT:
             self.undo_stack = self.undo_stack[-self._UNDO_LIMIT:]
 
+    def _stage_index(self, stages, stage):
+        """Index of the exact stage; falls back to value equality because
+        undoing a bulk_replace restores deepcopy clones of the objects
+        that older ops still reference.
+
+        Identity first: ObsPy stages compare by value, so two equal
+        stages (duplicate/None sequence numbers) would make a plain
+        index()/remove() hit the wrong one. Pole/zero ops need none of
+        this — they are purely positional over value-type complex
+        numbers, where equal values are interchangeable."""
+        idx = _identity_index(stages, stage)
+        if idx is not None:
+            return idx
+        try:
+            return stages.index(stage)
+        except ValueError:
+            return None
+
     def _capture_forward(self, op):
         # Save what _apply_reverse is about to destroy so redo can restore
         # it (e.g. reversing add_pole pops and discards the pole).
@@ -1236,7 +1255,8 @@ class ResponseTab(QWidget):
         if tag == "add_stage":
             _, response, stage = op
             stages = response.response_stages
-            return stages.index(stage) if stage in stages else len(stages)
+            idx = self._stage_index(stages, stage)
+            return idx if idx is not None else len(stages)
         if tag == "bulk_replace":
             _, response, _stages, _sens = op
             return (
@@ -1275,7 +1295,9 @@ class ResponseTab(QWidget):
             return ("structural",)
         if tag == "add_stage":
             _, response, stage = op
-            if stage not in response.response_stages:
+            # Identity-only guard: undo just removed this exact object,
+            # so redo must insert it even when an equal twin remains.
+            if _identity_index(response.response_stages, stage) is None:
                 response.response_stages.insert(captured, stage)
                 self._renumber_stages()
             return ("structural",)
@@ -1289,8 +1311,9 @@ class ResponseTab(QWidget):
             return ("structural",)
         if tag == "delete_stage":
             _, response, removed, _index = op
-            if removed in response.response_stages:
-                response.response_stages.remove(removed)
+            idx = self._stage_index(response.response_stages, removed)
+            if idx is not None:
+                del response.response_stages[idx]
                 self._renumber_stages()
             return ("structural",)
         if tag == "delete_field":
@@ -1334,8 +1357,9 @@ class ResponseTab(QWidget):
             return ("structural",)
         if tag == "add_stage":
             _, response, stage = op
-            if stage in response.response_stages:
-                response.response_stages.remove(stage)
+            idx = self._stage_index(response.response_stages, stage)
+            if idx is not None:
+                del response.response_stages[idx]
                 self._renumber_stages()
             return ("structural",)
         if tag == "delete_pole":

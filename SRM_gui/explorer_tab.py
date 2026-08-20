@@ -602,14 +602,18 @@ class ExplorerTab(QWidget):
                     tint_warning(net_item)
         except Exception as e:
             QTreeWidgetItem(self.tree, ["Error", str(e)])
-        if expanded or selected_path:
-            self._restore_tree_state(expanded, selected_path)
-        if (self.station_filter.text().strip()
-                or self.search_bar.text().strip()):
-            self.filter_tree()
-        self.tree.blockSignals(False)
-        self.tree.setUpdatesEnabled(True)
-        self._suppress_edits = False
+        try:
+            if expanded or selected_path:
+                self._restore_tree_state(expanded, selected_path)
+            if (self.station_filter.text().strip()
+                    or self.search_bar.text().strip()):
+                self.filter_tree()
+        finally:
+            # Always re-enable, or one exception above would leave the
+            # tree frozen and silently dropping every future edit.
+            self.tree.blockSignals(False)
+            self.tree.setUpdatesEnabled(True)
+            self._suppress_edits = False
 
     def on_tree_selection_changed(self):
         item = self.tree.currentItem()
