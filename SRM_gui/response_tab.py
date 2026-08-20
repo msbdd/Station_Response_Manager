@@ -17,10 +17,9 @@ from PyQt5.QtWidgets import (
     QHBoxLayout,
     QFormLayout,
     QFileDialog,
-    QShortcut,
 )
 from copy import deepcopy
-from PyQt5.QtGui import QColor, QBrush, QKeySequence
+from PyQt5.QtGui import QColor, QBrush
 from PyQt5.QtCore import Qt, QTimer
 from SRM_core.utils import (
     combine_resp,
@@ -32,13 +31,14 @@ from SRM_core.utils import (
 import os
 import copy
 import configparser
+import logging
 from matplotlib.backends.backend_qt5agg import (
     FigureCanvasQTAgg as FigureCanvas,
 )
 from matplotlib.figure import Figure
 import numpy as np
 from obspy import read_inventory
-from SRM_gui.explorer_tab import _identity_index
+from SRM_gui.explorer_tab import _identity_index, notify_inventory_changed
 from obspy.core.inventory.response import (
     ResponseStage,
     PolesZerosResponseStage,
@@ -50,6 +50,8 @@ from obspy.core.inventory.response import (
 )
 from obspy.clients.nrl import NRL
 
+
+logger = logging.getLogger(__name__)
 
 _BASELINE_ROLE = Qt.UserRole + 1
 
@@ -119,21 +121,14 @@ class ResponseTab(QWidget):
         self._suppress_edits = False
         self._field_index = {}
         self._pz_index = {}
+        self._rebuild_stage_baseline_map(self.response)
         self.response_layout = QVBoxLayout(self)
         self.load_response_editor(self.response)
 
-        self.undo_shortcut = QShortcut(QKeySequence.Undo, self)
-        self.undo_shortcut.setContext(Qt.WidgetWithChildrenShortcut)
-        self.undo_shortcut.activated.connect(self.undo)
-        # Explicit sequences instead of QKeySequence.Redo: on platforms
-        # where the standard redo is Ctrl+Y, binding both would register
-        # the same key twice and make the shortcut ambiguous (never fires).
-        self.redo_shortcut = QShortcut(QKeySequence("Ctrl+Y"), self)
-        self.redo_shortcut.setContext(Qt.WidgetWithChildrenShortcut)
-        self.redo_shortcut.activated.connect(self.redo)
-        self.redo_shortcut_alt = QShortcut(QKeySequence("Ctrl+Shift+Z"), self)
-        self.redo_shortcut_alt.setContext(Qt.WidgetWithChildrenShortcut)
-        self.redo_shortcut_alt.activated.connect(self.redo)
+        # Undo/redo are driven by the window-level Edit menu, which
+        # dispatches to the current tab: a WidgetWithChildrenShortcut
+        # here would be dead whenever focus sat outside this subtree and
+        # would clash with the menu's shortcuts.
 
     def load_response_editor(self, response):
         self.selected_response = response
@@ -241,11 +236,17 @@ class ResponseTab(QWidget):
         self.canvas.draw()
 
     def revert_response(self):
+        # The op must hold the LIVE stage/sensitivity objects, not copies:
+        # older undo ops reference exactly these objects, so undoing the
+        # bulk_replace has to put them back as-is or every earlier undo
+        # would silently mutate orphans while the UI shows nothing.
+        # Holding them is safe because the lines below *replace* the live
+        # list/sensitivity rather than mutating them.
         self._push_undo((
             "bulk_replace",
             self.response,
-            copy.deepcopy(self.response.response_stages),
-            copy.deepcopy(self.response.instrument_sensitivity),
+            list(self.response.response_stages),
+            self.response.instrument_sensitivity,
         ))
         self.response.response_stages = deepcopy(
             self.original_response.response_stages
@@ -253,6 +254,7 @@ class ResponseTab(QWidget):
         self.response.instrument_sensitivity = deepcopy(
             self.original_response.instrument_sensitivity
         )
+        self._rebuild_stage_baseline_map(self.response)
         self.load_response_editor(self.response)
         QMessageBox.information(
             self, "Reverted",
@@ -263,6 +265,12 @@ class ResponseTab(QWidget):
         self.original_response = deepcopy(self.selected_response)
         self.undo_stack.clear()
         self.redo_stack.clear()
+        self._rebuild_stage_baseline_map(self.selected_response)
+        # The old baselines are baked into every row's _BASELINE_ROLE, so
+        # without a rebuild the just-saved edits would keep rendering as
+        # unsaved until some unrelated action repopulated the tree.
+        self.populate_stage_tree(self.selected_response)
+        self._refresh_sens_label()
 
     def _sens_label_text(self):
         sens = self.selected_response.instrument_sensitivity
@@ -302,12 +310,43 @@ class ResponseTab(QWidget):
     @staticmethod
     def _values_differ(current, baseline):
         try:
+            # None and "" both render as an empty cell and both mean
+            # "not set" (populate normalizes units with ``or ""`` while
+            # the edit path stores None) — never flag that pair as a
+            # modification.
+            if current in (None, "") and baseline in (None, ""):
+                return False
             return current != baseline
         except Exception:
             return True
 
+    def _rebuild_stage_baseline_map(self, response):
+        """Pair each live stage with its baseline twin by identity.
+
+        Positional matching alone would mark every stage after a deleted
+        one as modified (the survivors shift onto the wrong baselines).
+        Callers rebuild this map exactly when live and baseline stages
+        are known to align 1:1; stages absent from the map (newly added,
+        or a wholesale replacement) have no baseline and render as
+        modified, which is what an unsaved stage should do."""
+        base = (
+            self.original_response.response_stages
+            if self.original_response is not None else []
+        )
+        self._stage_baseline_map = {
+            id(s): b for s, b in zip(response.response_stages, base)
+        }
+
     def populate_stage_tree(self, response):
         self._suppress_edits = True
+        try:
+            self._populate_stage_tree_inner(response)
+        finally:
+            # Always re-enable, or one exception above would leave the
+            # editor frozen and silently dropping every future edit.
+            self._suppress_edits = False
+
+    def _populate_stage_tree_inner(self, response):
         self.stage_tree.clear()
         self._field_index = {}
         self._pz_index = {}
@@ -396,12 +435,6 @@ class ResponseTab(QWidget):
             if self.original_response is not None
             else None
         )
-        baseline_stages = (
-            self.original_response.response_stages
-            if self.original_response is not None
-            else []
-        )
-
         if response.instrument_sensitivity:
             sens = response.instrument_sensitivity
             sens_item = QTreeWidgetItem(
@@ -437,9 +470,7 @@ class ResponseTab(QWidget):
             )
 
         for i, stage in enumerate(response.response_stages):
-            baseline_stage = (
-                baseline_stages[i] if i < len(baseline_stages) else None
-            )
+            baseline_stage = self._stage_baseline_map.get(id(stage))
             stage_item = QTreeWidgetItem(
                 self.stage_tree,
                 [f"Stage {i+1}: {type(stage).__name__}", _units_label(stage)],
@@ -506,7 +537,6 @@ class ResponseTab(QWidget):
                     self._pz_index[(id(stage), "zero", j)] = zero_item
 
         self._add_validation_section(response)
-        self._suppress_edits = False
 
     def _add_validation_section(self, response):
         issues = validate_response(response)
@@ -621,20 +651,6 @@ class ResponseTab(QWidget):
             setattr(ref_object, attr, new_value)
             self._push_undo(("edit", ref_object, attr, old_value))
 
-            baseline_value = item.data(0, _BASELINE_ROLE)
-            self._suppress_edits = True
-            try:
-                self._apply_modified_style(
-                    item, self._values_differ(new_value, baseline_value)
-                )
-            finally:
-                self._suppress_edits = False
-
-            self._sync_units_display(ref_object, attr)
-            self._refresh_sens_label()
-            self._refresh_validation_section()
-            self.plot_response(self.selected_response)
-
         except Exception as e:
             QMessageBox.warning(
                 self, "Edit Error", f"Failed to update {attr}: {e}"
@@ -642,6 +658,28 @@ class ResponseTab(QWidget):
             self._suppress_edits = True
             item.setText(1, str(old_value))
             self._suppress_edits = False
+            return
+
+        baseline_value = item.data(0, _BASELINE_ROLE)
+        self._suppress_edits = True
+        try:
+            self._apply_modified_style(
+                item, self._values_differ(new_value, baseline_value)
+            )
+        finally:
+            self._suppress_edits = False
+
+        try:
+            self._sync_units_display(ref_object, attr)
+            self._refresh_sens_label()
+            self._refresh_validation_section()
+            self.plot_response(self.selected_response)
+        except Exception:
+            # The model already holds the new value and the undo op is
+            # pushed — only an auxiliary refresh failed. Reverting the
+            # row here (as the commit handler above does) would display
+            # a value the model no longer has.
+            logger.exception("Post-edit refresh failed for %s", attr)
 
     def edit_complex_value(self, item, column):
         if column != 1:
@@ -726,11 +764,13 @@ class ResponseTab(QWidget):
             and hasattr(self, "selected_response")
             and self.selected_response
         ):
+            # Live objects, not copies — see the comment in
+            # revert_response: older undo ops reference exactly these.
             self._push_undo((
                 "bulk_replace",
                 self.selected_response,
-                copy.deepcopy(self.selected_response.response_stages),
-                copy.deepcopy(self.selected_response.instrument_sensitivity),
+                list(self.selected_response.response_stages),
+                self.selected_response.instrument_sensitivity,
             ))
             self.selected_response.response_stages = copy.deepcopy(
                 new_resp.response_stages
@@ -738,6 +778,9 @@ class ResponseTab(QWidget):
             self.selected_response.instrument_sensitivity = copy.deepcopy(
                 new_resp.instrument_sensitivity
             )
+            # Nothing in the replacement corresponds to the baseline:
+            # every stage renders as modified until the next save.
+            self._stage_baseline_map = {}
 
             self.load_response_editor(self.selected_response)
             self.plot_response(self.selected_response)
@@ -756,6 +799,16 @@ class ResponseTab(QWidget):
                 self, "Recalculate Sensitivity",
                 "This response has no instrument sensitivity to "
                 "recalculate."
+            )
+            return
+        if not response.response_stages:
+            # Without stages there is nothing to recalculate FROM — the
+            # ValueError fallback below would otherwise replace a stated
+            # calibration value with an empty-chain product.
+            QMessageBox.information(
+                self, "Recalculate Sensitivity",
+                "This response has no stages to recalculate from; the "
+                "stated sensitivity was left unchanged."
             )
             return
         old_value = sens.value
@@ -808,7 +861,12 @@ class ResponseTab(QWidget):
 
     def new(self):
         item = self.stage_tree.currentItem()
-        if not item:
+        # An empty response has no stage rows to select at all (the tree
+        # holds at most a validation section), so New must offer the
+        # first stage regardless of selection — otherwise a new
+        # channel's blank Response() could never be populated.
+        no_stages = not self.selected_response.response_stages
+        if not item and not no_stages:
             QMessageBox.warning(
                 self,
                 "No Selection",
@@ -816,7 +874,7 @@ class ResponseTab(QWidget):
             )
             return
 
-        ref = item.data(0, Qt.UserRole)
+        ref = item.data(0, Qt.UserRole) if item else None
 
         if isinstance(ref, tuple):
             ref_type = ref[0]
@@ -843,10 +901,12 @@ class ResponseTab(QWidget):
                 )
                 return
 
-        #  New Stage
+        #  New Stage — decided by the UserRole payload, not the label
+        #  text: startswith("Stage") also matched the "Stage Gain" field
+        #  row, and currentItem() never returns the invisible root.
         is_stage_node = (
-            item.text(0).startswith("Stage")
-            or item == self.stage_tree.invisibleRootItem()
+            no_stages
+            or (isinstance(ref, tuple) and ref and ref[0] == "stage")
         )
 
         if is_stage_node:
@@ -890,6 +950,11 @@ class ResponseTab(QWidget):
                 return
 
             new_stage = builder_func()
+            if new_stage is None:
+                # The user cancelled one of the builder's sub-dialogs;
+                # falling through would show the bogus "Unsupported
+                # Selection" warning.
+                return
 
             if new_stage:
                 new_index = len(self.selected_response.response_stages)
@@ -1145,7 +1210,11 @@ class ResponseTab(QWidget):
             return
 
         ref = item.data(0, Qt.UserRole)
-        if not ref:
+        if not ref or (isinstance(ref, tuple)
+                       and ref[0] == "validation_section"):
+            # The warnings section is not user data — deleting it is
+            # meaningless, so don't offer a confirm that then does
+            # nothing.
             return
 
         reply = QMessageBox.question(
@@ -1217,11 +1286,13 @@ class ResponseTab(QWidget):
         self.undo_stack.append(op)
         if len(self.undo_stack) > self._UNDO_LIMIT:
             self.undo_stack = self.undo_stack[-self._UNDO_LIMIT:]
+        notify_inventory_changed(self.main_window)
 
     def _stage_index(self, stages, stage):
-        """Index of the exact stage; falls back to value equality because
-        undoing a bulk_replace restores deepcopy clones of the objects
-        that older ops still reference.
+        """Index of the exact stage, with a value-equality fallback as a
+        last resort (bulk_replace ops now carry live objects, so identity
+        normally holds; the fallback only matters for ops that somehow
+        outlive their objects).
 
         Identity first: ObsPy stages compare by value, so two equal
         stages (duplicate/None sequence numbers) would make a plain
@@ -1324,6 +1395,7 @@ class ResponseTab(QWidget):
             _, response, _stages, _sens = op
             response.response_stages = captured[0]
             response.instrument_sensitivity = captured[1]
+            self._rebuild_stage_baseline_map(response)
             return ("structural",)
         return ("structural",)
 
@@ -1383,17 +1455,22 @@ class ResponseTab(QWidget):
             _, response, stages_snapshot, sens_snapshot = op
             response.response_stages = stages_snapshot
             response.instrument_sensitivity = sens_snapshot
+            self._rebuild_stage_baseline_map(response)
             return ("structural",)
         return ("structural",)
 
     def undo(self):
         if not self.undo_stack:
             return
-        op = self.undo_stack.pop()
+        # Peek, apply, then move: popping before the apply would lose the
+        # op from both stacks on failure — the mutation would stay while
+        # has_unsaved_changes() could go False.
+        op = self.undo_stack[-1]
         fast = False
         try:
             captured = self._capture_forward(op)
             result = self._apply_reverse(op)
+            self.undo_stack.pop()
             self.redo_stack.append((op, captured))
             if result[0] == "field":
                 _, ref_object, attr, value = result
@@ -1416,10 +1493,11 @@ class ResponseTab(QWidget):
     def redo(self):
         if not self.redo_stack:
             return
-        op, captured = self.redo_stack.pop()
+        op, captured = self.redo_stack[-1]
         fast = False
         try:
             result = self._apply_forward(op, captured)
+            self.redo_stack.pop()
             # Append directly: _push_undo would clear the redo stack.
             self.undo_stack.append(op)
             if result[0] == "field":
@@ -1450,6 +1528,7 @@ class ResponseTab(QWidget):
         self.response.instrument_sensitivity = deepcopy(
             self.original_response.instrument_sensitivity
         )
+        self._rebuild_stage_baseline_map(self.response)
         self.undo_stack.clear()
         self.redo_stack.clear()
 

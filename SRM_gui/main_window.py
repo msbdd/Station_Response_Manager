@@ -10,6 +10,7 @@ from PyQt5.QtWidgets import (
     QLabel,
 )
 from PyQt5.QtCore import QSettings
+from PyQt5.QtGui import QKeySequence
 from SRM_core.utils import (
     resource_path,
     convert_inventory_to_xml,
@@ -30,6 +31,39 @@ from SRM_gui.explorer_tab import ExplorerTab
 from SRM_gui.response_tab import ResponseTab
 from SRM_gui.dialogs import StationInventoryWizard, ImportFromMiniSEEDDialog
 from SRM_gui.review_dialog import ReviewChangesDialog
+
+
+def save_targets(items, loaded_paths):
+    """Decide where each loaded file is written on a Save All.
+
+    Returns ``(write_items, failures)`` where write_items are
+    ``(source_path, target_path, inventory)`` triples and failures are
+    ``(source_path, message)`` pairs for files that get no job at all.
+
+    ObsPy can only write StationXML, so a non-.xml source (dataless SEED)
+    is redirected to its ``.xml`` sibling and the original is left alone
+    — writing in place would silently replace the SEED bytes under the
+    original name. A redirect that would collide with another loaded
+    file (or another redirect in the same batch) is refused rather than
+    letting one file overwrite another.
+    """
+    failures = []
+    write_items = []
+    claimed = set()
+    for fp, inv in items:
+        if fp.lower().endswith(".xml"):
+            target = fp
+        else:
+            target = str(Path(fp).with_suffix(".xml"))
+            if target in loaded_paths or target in claimed:
+                failures.append((fp, (
+                    "cannot convert to StationXML: "
+                    f"{os.path.basename(target)} is already loaded"
+                )))
+                continue
+        claimed.add(target)
+        write_items.append((fp, target, inv))
+    return write_items, failures
 
 
 def save_outcome(items, failed_paths, summary):
@@ -129,6 +163,21 @@ class MainWindow(QMainWindow):
         exit_action.setShortcut("Ctrl+Q")
         exit_action.triggered.connect(self.close)
         file_menu.addAction(exit_action)
+        # Window-level undo/redo: the per-tab shortcuts they replace only
+        # fired while focus was inside that tab's widget subtree, which
+        # left the manager's history unreachable behind the map view.
+        edit_menu = menubar.addMenu("Edit")
+        undo_action = QAction("Undo", self)
+        undo_action.setShortcut(QKeySequence.Undo)
+        undo_action.triggered.connect(lambda: self._dispatch_history("undo"))
+        edit_menu.addAction(undo_action)
+        redo_action = QAction("Redo", self)
+        redo_action.setShortcuts(
+            [QKeySequence("Ctrl+Y"), QKeySequence("Ctrl+Shift+Z")]
+        )
+        redo_action.triggered.connect(lambda: self._dispatch_history("redo"))
+        edit_menu.addAction(redo_action)
+
         tools_menu = menubar.addMenu("Tools")
         build_inventory = QAction("Build Inventory", self)
         build_inventory.triggered.connect(self.build_new_inventory)
@@ -161,6 +210,24 @@ class MainWindow(QMainWindow):
             lambda: self.close_tab(self.tabs.currentIndex())
         )
         view_menu.addAction(close_tab_action)
+
+    def mark_inventory_changed(self):
+        """An Explorer/Response edit changed objects the Manager renders.
+
+        Refreshing the Manager on every keystroke would rebuild the whole
+        tree, so just flag it: the tab rebuilds when it is next shown."""
+        self.manager_tab.mark_stale()
+
+    def _dispatch_history(self, action):
+        """Route Undo/Redo to the tab the user is looking at.
+
+        Each tab owns its own stack, so the visible tab is the only
+        correct target — a global stack would reverse edits the user
+        cannot see."""
+        widget = self.tabs.currentWidget()
+        method = getattr(widget, action, None)
+        if callable(method):
+            method()
 
     def _change_font_size(self, delta):
         app = QApplication.instance()
@@ -220,31 +287,35 @@ class MainWindow(QMainWindow):
             if dialog.exec_() != QDialog.Accepted:
                 return
 
-        failed_paths = set()
+        write_items, failures = save_targets(items, self.loaded_files)
+        failed_paths = {fp for fp, _msg in failures}
+
         jobs = [
             (
-                f"Saving {os.path.basename(fp)}...",
-                (lambda fp=fp, inv=inv:
-                 atomic_write_inventory(inv, fp, fmt="STATIONXML")),
+                f"Saving {os.path.basename(target)}...",
+                (lambda target=target, inv=inv:
+                 atomic_write_inventory(inv, target, fmt="STATIONXML")),
             )
-            for fp, inv in items
+            for _fp, target, inv in write_items
         ]
 
         def on_result(idx, _result, error):
+            # Only collect here; a modal box would spin a nested event
+            # loop that the still-running batch keeps emitting into
+            # (worst case the dialog accept()s underneath its own modal
+            # child). One summary is shown in on_done instead.
             if error is not None:
-                fp = items[idx][0]
+                fp = write_items[idx][0]
                 failed_paths.add(fp)
-                QMessageBox.warning(
-                    self, "Error", f"Failed to save {fp}:\n{error}"
-                )
+                failures.append((fp, str(error)))
 
         def on_done(summary):
             saved_paths, fully_saved = save_outcome(
-                items, failed_paths, summary
+                [(fp, inv) for fp, _target, inv in write_items],
+                failed_paths, summary
             )
             if fully_saved:
-                self.manager_tab.undo_stack.clear()
-                self.manager_tab.redo_stack.clear()
+                self.manager_tab.clear_history()
             for key, widget in self.open_tabs.items():
                 if key[0] == "explorer" and isinstance(widget, ExplorerTab):
                     if key[1] not in saved_paths:
@@ -261,18 +332,66 @@ class MainWindow(QMainWindow):
                     if tab_path and tab_path in saved_paths:
                         widget.commit_baseline()
 
+            # Re-key files that were saved to a converted .xml sibling:
+            # from here on the session tracks (and future saves write)
+            # the new path; the original dataless file is never touched.
+            renames = [
+                (fp, target) for fp, target, _inv in write_items
+                if target != fp and fp in saved_paths
+            ]
+            for old, new in renames:
+                self.loaded_files[new] = self.loaded_files.pop(old)
+                for key in list(self.open_tabs):
+                    if key[0] == "explorer" and key[1] == old:
+                        widget = self.open_tabs.pop(key)
+                        widget.filepath = new
+                        self.open_tabs[("explorer", new) + key[2:]] = widget
+                        idx = self.tabs.indexOf(widget)
+                        if idx != -1:
+                            self.tabs.setTabText(idx, self.tabs.tabText(
+                                idx).replace(os.path.basename(old),
+                                             os.path.basename(new)))
+
             self.manager_tab.refresh()
+
+            notes = []
+            if renames:
+                notes.append(
+                    "Dataless SEED cannot be written back, so these were "
+                    "saved as new StationXML files (originals untouched):\n"
+                    + "\n".join(
+                        f"  {os.path.basename(o)} → {os.path.basename(n)}"
+                        for o, n in renames
+                    )
+                )
+            if failures:
+                notes.append(
+                    "These files were NOT saved:\n" + "\n".join(
+                        f"  {os.path.basename(fp)}: {msg}"
+                        for fp, msg in failures
+                    )
+                )
             if fully_saved:
                 QMessageBox.information(
                     self, "Save Complete",
-                    "All inventories saved successfully.",
+                    "\n\n".join(["All inventories saved successfully."]
+                                + notes),
                 )
             elif summary.canceled:
                 QMessageBox.warning(
                     self, "Save Cancelled",
-                    f"Save cancelled — {len(saved_paths)} of {len(items)} "
-                    "files saved. The remaining files still have unsaved "
-                    "changes.",
+                    "\n\n".join([
+                        f"Save cancelled — {len(saved_paths)} of "
+                        f"{len(items)} files saved. The remaining files "
+                        "still have unsaved changes."
+                    ] + notes),
+                )
+            else:
+                QMessageBox.warning(
+                    self, "Save Incomplete",
+                    "\n\n".join([
+                        f"{len(saved_paths)} of {len(items)} files saved."
+                    ] + notes),
                 )
 
         self._run_jobs("Saving files", jobs, on_result, on_done)
@@ -444,6 +563,8 @@ class MainWindow(QMainWindow):
 
         if inventory_touched:
             self.manager_tab.refresh()
+            # Reverting the tab's edits changes the issue counts too.
+            self.update_status_bar()
             for k, t in self.open_tabs.items():
                 if (k[0] == "explorer" and isinstance(t, ExplorerTab)
                         and t.current_inventory is not None):
@@ -498,6 +619,16 @@ class MainWindow(QMainWindow):
 
         # Same key format as the load flow, so duplicate detection works.
         filepath = str(Path(filepath).resolve())
+        if filepath in self.loaded_files:
+            # Proceeding would wipe the disk file with an empty inventory
+            # while the open tabs keep editing the orphaned old object —
+            # their edits could never be saved.
+            QMessageBox.warning(
+                self, "File Already Loaded",
+                "This file is open in the current session. Close it first "
+                "if you want to replace it with a new inventory."
+            )
+            return
         try:
             inv = Inventory(networks=[], source="Seismic Response Manager")
             # Write first: registering a file whose write failed would

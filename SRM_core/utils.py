@@ -24,13 +24,18 @@ SENS_TOLERANCE = 0.05
 
 
 def stage_gain_product(stages):
-    """Product of all stage gains, or None if any stage lacks a usable
-    non-zero gain — a partial product would be misleading.
+    """Product of all stage gains, or None if the stage list is empty or
+    any stage lacks a usable non-zero gain — a partial product would be
+    misleading, and an empty chain has no product at all (returning the
+    identity 1.0 here once let "Recalculate Sensitivity" replace a stated
+    calibration value with 1.0 on stage-less responses).
 
     This is the first-order estimate of the overall sensitivity: it ignores
     the frequency dependence between the individual gain frequencies, but
     catches order-of-magnitude errors without running evalresp.
     """
+    if not stages:
+        return None
     product = 1.0
     for s in stages:
         gain = getattr(s, 'stage_gain', None)
@@ -197,8 +202,10 @@ def atomic_write_inventory(inventory, path, fmt="STATIONXML"):
             mode = 0o666 & ~mask
         os.chmod(tmp_path, mode)
         # Flush data to disk before the rename so a power loss cannot
-        # leave an empty file under the original name.
-        with open(tmp_path, 'rb') as f:
+        # leave an empty file under the original name. The handle must be
+        # writable: fsync on a read-only fd is only permitted to work on
+        # Linux (POSIX allows EBADF) and fails outright on Windows.
+        with open(tmp_path, 'r+b') as f:
             os.fsync(f.fileno())
         os.replace(tmp_path, path)
     except Exception:
@@ -207,6 +214,19 @@ def atomic_write_inventory(inventory, path, fmt="STATIONXML"):
         except OSError:
             pass
         raise
+    # Persist the rename itself: without a directory fsync the new entry
+    # can be lost on power failure even though the file data is safe.
+    # Windows has no O_DIRECTORY (NTFS journals the rename); the file is
+    # already in place, so failure here must not raise.
+    if hasattr(os, "O_DIRECTORY"):
+        try:
+            dir_fd = os.open(directory, os.O_RDONLY | os.O_DIRECTORY)
+            try:
+                os.fsync(dir_fd)
+            finally:
+                os.close(dir_fd)
+        except OSError:
+            pass
 
 
 def convert_inventory_to_xml(input_path: str, output_path: str):

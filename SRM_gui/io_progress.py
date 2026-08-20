@@ -94,6 +94,24 @@ class IOProgressDialog(QDialog):
         self.cancel_btn.setEnabled(False)
         self.status_label.setText("Cancelling...")
 
+    def reject(self):
+        # Esc lands here via QDialog's default key handling. Closing the
+        # dialog while the worker is mid-write would drop the modal guard
+        # and let the user mutate the very objects being serialized (and
+        # skip on_done, leaving undo stacks/baselines uncommitted), so
+        # route it to Cancel; the finished_all path closes the dialog.
+        if self.worker.isRunning():
+            self._on_cancel_clicked()
+            return
+        super().reject()
+
+    def closeEvent(self, event):
+        if self.worker.isRunning():
+            self._on_cancel_clicked()
+            event.ignore()
+            return
+        super().closeEvent(event)
+
     def _on_progress(self, idx, total, label):
         truncated = label if len(label) <= 80 else label[:77] + "..."
         if total > 1:
@@ -113,6 +131,11 @@ class IOProgressDialog(QDialog):
             self.overall_bar.setValue(idx + 1)
 
     def _on_finished_all(self):
+        # finished_all is run()'s last statement, but the thread is still
+        # unwinding; wait for it to exit before the dialog (which owns the
+        # QThread) can be destroyed, or Qt aborts the process with
+        # "QThread: Destroyed while thread is still running".
+        self.worker.wait()
         # Freeze the marquee at "full" briefly so it doesn't look mid-stride.
         self.activity_bar.setRange(0, 1)
         self.activity_bar.setValue(1)

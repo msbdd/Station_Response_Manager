@@ -99,6 +99,11 @@ class IndexProgressDialog(QDialog):
         QApplication.processEvents()
 
     def _on_finished(self, sensors_count, dataloggers_count):
+        # NOTE: never call setWindowFlags() here — on a visible window it
+        # re-parents and *hides* the dialog, which exits the modal event
+        # loop before the user can read the result. The Close button is
+        # the way out; the title-bar close button stays hidden.
+        self.worker.wait()
         self.progress_bar.setValue(100)
         self.status_label.setText("Indexing complete!")
         self.result_label.setText(
@@ -106,12 +111,26 @@ class IndexProgressDialog(QDialog):
             f"{dataloggers_count} dataloggers."
         )
         self.close_btn.setEnabled(True)
-        self.setWindowFlags(self.windowFlags() | Qt.WindowCloseButtonHint)
 
     def _on_error(self, error_msg):
+        self.worker.wait()
         self.status_label.setText(f"Error: {error_msg}")
         self.result_label.setText("Indexing failed. "
                                   "You can try rebuilding later.")
         self.result_label.setStyleSheet("font-weight: bold; color: red;")
         self.close_btn.setEnabled(True)
-        self.setWindowFlags(self.windowFlags() | Qt.WindowCloseButtonHint)
+
+    def reject(self):
+        # Esc: the build worker has no cancel support, and destroying the
+        # dialog (which owns the QThread) mid-run aborts the process with
+        # "QThread: Destroyed while thread is still running" — ignore
+        # until the worker is done.
+        if self.worker.isRunning():
+            return
+        super().reject()
+
+    def closeEvent(self, event):
+        if self.worker.isRunning():
+            event.ignore()
+            return
+        super().closeEvent(event)

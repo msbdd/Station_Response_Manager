@@ -169,6 +169,7 @@ class NRLIndex:
         self._sensor_signatures: Dict[str, List[InstrumentInfo]] = {}
         self._datalogger_signatures: Dict[str, List[InstrumentInfo]] = {}
         self._datalogger_family_sigs: Dict[str, List[InstrumentInfo]] = {}
+        self._detection_cache: Dict = {}
 
     @property
     def is_loaded(self) -> bool:
@@ -206,68 +207,86 @@ class NRLIndex:
             return False
         try:
             with open(self.index_path, 'r', encoding='utf-8') as f:
-                self._index = json.load(f)
+                index = json.load(f)
 
-            self._sensor_signatures = {}
-            for sig, info_data in self._index.get('sensors', {}).items():
+            sensor_sigs = {}
+            for sig, info_data in index.get('sensors', {}).items():
                 if isinstance(info_data, list):
-                    self._sensor_signatures[sig] = [
+                    sensor_sigs[sig] = [
                         InstrumentInfo(**info) for info in info_data
                     ]
                 else:
-                    self._sensor_signatures[sig] = [
+                    sensor_sigs[sig] = [
                         InstrumentInfo(**info_data)
                     ]
 
-            self._datalogger_signatures = {}
-            for sig, info_list in self._index.get('dataloggers', {}).items():
-                self._datalogger_signatures[sig] = [
+            datalogger_sigs = {}
+            for sig, info_list in index.get('dataloggers', {}).items():
+                datalogger_sigs[sig] = [
                     InstrumentInfo(**info) for info in info_list
                 ]
 
-            self._datalogger_family_sigs = {}
-            dl_family = self._index.get('dataloggers_family', {})
+            family_sigs = {}
+            dl_family = index.get('dataloggers_family', {})
             for sig, info_list in dl_family.items():
                 if isinstance(info_list, list):
-                    self._datalogger_family_sigs[sig] = [
+                    family_sigs[sig] = [
                         InstrumentInfo(**info) for info in info_list
                     ]
                 else:
-                    self._datalogger_family_sigs[sig] = [
+                    family_sigs[sig] = [
                         InstrumentInfo(**info_list)
                     ]
 
+            self._index = index
+            self._sensor_signatures = sensor_sigs
+            self._datalogger_signatures = datalogger_sigs
+            self._datalogger_family_sigs = family_sigs
             return True
         except (json.JSONDecodeError, IOError, KeyError, TypeError) as e:
             # TypeError: InstrumentInfo(**info) on schema drift — a
             # stale/corrupt index must trigger a rebuild, not a crash.
             logger.error("Error loading NRL index: %s", e)
+            self._index = None
+            self._sensor_signatures = {}
+            self._datalogger_signatures = {}
+            self._datalogger_family_sigs = {}
             return False
 
     def save_index(self) -> bool:
-        try:
-            data = {
-                'version': self.INDEX_VERSION,
-                'nrl_hash': self.get_nrl_modification_hash(),
-                'sensors': {
-                    sig: [asdict(info) for info in info_list]
-                    for sig, info_list in self._sensor_signatures.items()
-                },
-                'dataloggers': {
-                    sig: [asdict(info) for info in info_list]
-                    for sig, info_list in self._datalogger_signatures.items()
-                },
-                'dataloggers_family': {
-                    sig: [asdict(info) for info in info_list]
-                    for sig, info_list in self._datalogger_family_sigs.items()
-                }
+        data = {
+            'version': self.INDEX_VERSION,
+            'nrl_hash': self.get_nrl_modification_hash(),
+            'sensors': {
+                sig: [asdict(info) for info in info_list]
+                for sig, info_list in self._sensor_signatures.items()
+            },
+            'dataloggers': {
+                sig: [asdict(info) for info in info_list]
+                for sig, info_list in self._datalogger_signatures.items()
+            },
+            'dataloggers_family': {
+                sig: [asdict(info) for info in info_list]
+                for sig, info_list in self._datalogger_family_sigs.items()
             }
-            with open(self.index_path, 'w', encoding='utf-8') as f:
+        }
+
+        self._index = data
+        tmp_path = self.index_path + '.tmp'
+        try:
+            # Write-then-rename so a crash mid-dump can't leave a
+            # truncated file that shadows the good index.
+            with open(tmp_path, 'w', encoding='utf-8') as f:
                 json.dump(data, f, indent=2)
-            self._index = data
+            os.replace(tmp_path, self.index_path)
             return True
-        except IOError as e:
+        except OSError as e:
             logger.error("Error saving NRL index: %s", e)
+            try:
+                if os.path.exists(tmp_path):
+                    os.remove(tmp_path)
+            except OSError:
+                pass
             return False
 
     def build_index(self, progress_callback=None) -> Tuple[int, int]:
@@ -367,7 +386,13 @@ class NRLIndex:
         if progress_callback:
             progress_callback(total_files, total_files, "Saving index...")
 
-        self.save_index()
+        if not self.save_index():
+
+            raise IOError(
+                "The NRL index was built but could not be written to "
+                f"{self.index_path}. Instrument detection will work for "
+                "this session; the index will be rebuilt on next start."
+            )
 
         return len(self._sensor_signatures), len(self._datalogger_signatures)
 
@@ -419,7 +444,12 @@ class NRLIndex:
                                 dir_cache[xml_fname] = f"{section}: {desc}"
                             else:
                                 dir_cache[xml_fname] = section
-                except Exception:
+                except Exception as e:
+
+                    logger.warning(
+                        "Skipping NRL description file %s: %s",
+                        txt_path, e,
+                    )
                     continue
             if dir_cache:
                 cache[root] = dir_cache
@@ -664,12 +694,76 @@ class NRLIndex:
 
         return hasher.hexdigest()
 
+    # Detection hashes every stage of a response (FIR coefficients
+    # included) up to three times, and the manager rebuilds its whole
+    # tree on every undo/redo and save. Cache per response object so a
+    # rebuild is cheap; the cap keeps a long session bounded.
+    _DETECTION_CACHE_LIMIT = 8192
+
+    @staticmethod
+    def _detection_fingerprint(response: Response):
+        """Cheap value-fingerprint of the editable parts of a response.
+
+        Everything the editors can change (gains, units, frequencies,
+        poles/zeros, stage count) is included; FIR/coefficient arrays are
+        not, because hashing them is exactly the cost being avoided and
+        no editor can modify them. Paired with the response's id in the
+        cache key, so two distinct responses never share an entry even
+        if their editable parts match."""
+        stages = getattr(response, 'response_stages', None) or []
+        sens = getattr(response, 'instrument_sensitivity', None)
+        parts = [
+            len(stages),
+            getattr(sens, 'value', None),
+            getattr(sens, 'frequency', None),
+            getattr(sens, 'input_units', None),
+            getattr(sens, 'output_units', None),
+        ]
+        for s in stages:
+            parts.append((
+                type(s).__name__,
+                getattr(s, 'stage_gain', None),
+                getattr(s, 'stage_gain_frequency', None),
+                getattr(s, 'input_units', None),
+                getattr(s, 'output_units', None),
+                getattr(s, 'normalization_frequency', None),
+                getattr(s, 'decimation_factor', None),
+                tuple(getattr(s, 'poles', None) or ()),
+                tuple(getattr(s, 'zeros', None) or ()),
+            ))
+        return tuple(parts)
+
     def detect_instrument(self, response: Response) -> DetectionResult:
 
         if not self.is_loaded:
             if not self.load_index():
                 return DetectionResult()
 
+        cache_key = None
+        try:
+            cache_key = (id(response), self._detection_fingerprint(response))
+        except Exception:
+            # An unhashable/odd response just skips the cache.
+            cache_key = None
+        if cache_key is not None:
+            cached = self._detection_cache.get(cache_key)
+            if cached is not None:
+                return cached[1]
+
+        result = self._detect_instrument_uncached(response)
+
+        if cache_key is not None:
+            if len(self._detection_cache) >= self._DETECTION_CACHE_LIMIT:
+                self._detection_cache.clear()
+            # Keep a reference to the response alongside the result: it
+            # pins the id in the key, so a freed response's id can never
+            # be reused by another object while this entry is live.
+            self._detection_cache[cache_key] = (response, result)
+        return result
+
+    def _detect_instrument_uncached(
+        self, response: Response
+    ) -> DetectionResult:
         result = DetectionResult()
 
         sensor_sig = self._compute_sensor_signature(response)

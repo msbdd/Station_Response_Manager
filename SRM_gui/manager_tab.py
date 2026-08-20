@@ -9,13 +9,12 @@ from PyQt5.QtWidgets import (
     QSplitter,
     QHBoxLayout,
     QFileDialog,
-    QShortcut,
 )
 from copy import deepcopy
 from SRM_core.utils import atomic_write_inventory, make_export_inventory
 from PyQt5.QtWebEngineWidgets import QWebEngineView
 from PyQt5.QtWebChannel import QWebChannel
-from PyQt5.QtGui import QColor, QBrush, QKeySequence
+from PyQt5.QtGui import QColor, QBrush
 from PyQt5.QtCore import (
     Qt, QTimer, QUrl, QObject, pyqtSignal, pyqtSlot,
 )
@@ -50,6 +49,7 @@ class ManagerTab(QWidget):
         self.clipboard_item = None
         self.undo_stack = []
         self.redo_stack = []
+        self._stale = False
         splitter = QSplitter(Qt.Horizontal)
         left_widget = QWidget()
         left_layout = QVBoxLayout(left_widget)
@@ -89,6 +89,18 @@ class ManagerTab(QWidget):
         btn_layout.addWidget(new_view_btn)
 
         left_layout.addLayout(btn_layout)
+
+        # Visible undo/redo: the keyboard shortcuts alone left this
+        # history unreachable whenever focus was outside the tree.
+        history_layout = QHBoxLayout()
+        self.undo_btn = QPushButton("Undo")
+        self.undo_btn.clicked.connect(self.undo)
+        history_layout.addWidget(self.undo_btn)
+        self.redo_btn = QPushButton("Redo")
+        self.redo_btn.clicked.connect(self.redo)
+        history_layout.addWidget(self.redo_btn)
+        history_layout.addStretch()
+        left_layout.addLayout(history_layout)
         splitter.addWidget(left_widget)
         self.right_tabs = QTabWidget()
         self.map_view = QWebEngineView()
@@ -125,15 +137,11 @@ class ManagerTab(QWidget):
         splitter.setStretchFactor(1, 2)
         layout.addWidget(splitter)
 
-        self.undo_shortcut = QShortcut(QKeySequence.Undo, self)
-        self.undo_shortcut.setContext(Qt.WidgetWithChildrenShortcut)
-        self.undo_shortcut.activated.connect(self.undo)
-        self.redo_shortcut = QShortcut(QKeySequence("Ctrl+Y"), self)
-        self.redo_shortcut.setContext(Qt.WidgetWithChildrenShortcut)
-        self.redo_shortcut.activated.connect(self.redo)
-        self.redo_shortcut_alt = QShortcut(QKeySequence("Ctrl+Shift+Z"), self)
-        self.redo_shortcut_alt.setContext(Qt.WidgetWithChildrenShortcut)
-        self.redo_shortcut_alt.activated.connect(self.redo)
+        # Undo/redo are driven by the window-level Edit menu (and the
+        # buttons above), which dispatch to the current tab: a
+        # WidgetWithChildrenShortcut here was dead whenever focus sat
+        # outside this subtree — notably while the map web view had it.
+        self._sync_history_buttons()
 
     def get_color_for_network(self, network_name):
         if network_name not in self.network_colors:
@@ -146,7 +154,8 @@ class ManagerTab(QWidget):
             self.network_colors[network_name] = hex_color
         return self.network_colors[network_name]
 
-    def add_file_to_tree(self, abs_filepath, inventory):
+    def add_file_to_tree(self, abs_filepath, inventory,
+                         defer_side_views=False):
         file_item = QTreeWidgetItem(
             [os.path.basename(abs_filepath)]
         )
@@ -194,8 +203,9 @@ class ManagerTab(QWidget):
         self.all_stations.extend(
             self._station_markers_for_file(abs_filepath, inventory)
         )
-        self._push_markers()
-        self.update_timeline()
+        if not defer_side_views:
+            self._push_markers()
+            self.update_timeline()
 
     def _station_markers_for_file(self, filepath, inventory):
         # net_idx/sta_idx key the marker back to the tree by position —
@@ -339,7 +349,10 @@ class ManagerTab(QWidget):
             return
         filepath = file_item.data(0, Qt.UserRole)[1]
         inventory = self.main_window.loaded_files.get(filepath)
-        if inventory:
+        # `is not None`: an Inventory's truth value is its network count,
+        # so a loaded-but-empty one (a freshly created file) must still
+        # count as found.
+        if inventory is not None:
             self.main_window.open_explorer_tab(
                 filepath=filepath, inventory=inventory, force_new=True
             )
@@ -421,7 +434,7 @@ class ManagerTab(QWidget):
         if data and data[0] == "file":
             filepath = data[1]
             inventory = self.main_window.loaded_files.get(filepath)
-            if inventory:
+            if inventory is not None:
                 self.main_window.open_explorer_tab(
                     filepath=filepath, inventory=inventory
                 )
@@ -471,7 +484,7 @@ class ManagerTab(QWidget):
         elif type_ == "network" and target_data[0] == "file":
             net_copy = deepcopy(obj)
             inv = self.main_window.loaded_files.get(target_data[1])
-            if inv:
+            if inv is not None:
                 inv.networks.append(net_copy)
                 self._push_undo(("add_network", inv, net_copy))
                 pasted_item = self._add_network_to_tree(target_item, net_copy)
@@ -532,6 +545,8 @@ class ManagerTab(QWidget):
                     )
                     parent.removeChild(item)
                     self._mark_changed()
+                else:
+                    self._handle_stale_item()
         elif type_ == "channel":
             sta_data = parent.data(0, Qt.UserRole)
             if sta_data and sta_data[0] == "station":
@@ -543,6 +558,20 @@ class ManagerTab(QWidget):
                     )
                     parent.removeChild(item)
                     self._mark_changed()
+                else:
+                    self._handle_stale_item()
+
+    def _handle_stale_item(self):
+        # The row points at an object no longer in the inventory — another
+        # tab deleted or replaced it. Rebuild instead of silently doing
+        # nothing on a dead button.
+        QMessageBox.information(
+            self, "Item Out of Date",
+            "This item no longer exists in the inventory (it was changed "
+            "in another tab). The view has been refreshed."
+        )
+        self.refresh()
+        self.main_window.update_status_bar()
 
     def _add_network_to_tree(self, file_item, net):
         net_item = QTreeWidgetItem([f"Network: {net.code}"])
@@ -569,6 +598,14 @@ class ManagerTab(QWidget):
         chan_item.setData(0, Qt.UserRole, ("channel", chan))
         sta_item.addChild(chan_item)
         self._add_instrument_detection(chan_item, chan)
+        # Same validation adornment as the load path: without it new and
+        # pasted nodes render clean, disagree with the status-bar issue
+        # count, and sprout warnings only on the next full refresh.
+        if self._add_validation_warnings(chan_item, chan):
+            parent = sta_item
+            while parent is not None:
+                self._tint_warning(parent)
+                parent = parent.parent()
 
         return chan_item
 
@@ -599,8 +636,14 @@ class ManagerTab(QWidget):
         if type_ == "file":
             filepath = obj
             inventory = self.main_window.loaded_files.get(filepath)
-            if not inventory:
-                inventory = Inventory()
+            if inventory is None:
+                # Only when the file really isn't loaded. Testing
+                # falsiness here replaced a loaded-but-empty inventory
+                # with a fresh object, orphaning any explorer tab
+                # already editing the original.
+                inventory = Inventory(
+                    networks=[], source="Seismic Response Manager"
+                )
                 self.main_window.loaded_files[filepath] = inventory
 
             from obspy.core.inventory import Network
@@ -725,7 +768,7 @@ class ManagerTab(QWidget):
         loc_code="", start_ts=0.0,
     ):
         inventory = self.main_window.loaded_files.get(filepath)
-        if not inventory:
+        if inventory is None:
             return
         explorer = self.main_window.open_explorer_tab(
             filepath, inventory, force_new=True
@@ -741,11 +784,38 @@ class ManagerTab(QWidget):
         self.update_timeline()
 
     def refresh(self):
+        self._stale = False
         self.file_tree.clear()
         self.all_stations.clear()
         self.network_colors.clear()
         for filepath, inventory in self.main_window.loaded_files.items():
-            self.add_file_to_tree(filepath, inventory)
+            # Markers and timeline are pushed once below; per-file pushes
+            # would rebuild them len(loaded_files) times per refresh.
+            self.add_file_to_tree(filepath, inventory,
+                                  defer_side_views=True)
+        self._push_markers()
+        self.update_timeline()
+
+    def mark_stale(self):
+        """Another tab edited the inventory this tree renders.
+
+        Without this the tree keeps showing deleted stations: selecting
+        one and pressing Delete matched nothing and silently did nothing,
+        and copying one could resurrect it into the next save."""
+        self._stale = True
+        if self.isVisible():
+            self._refresh_if_stale()
+
+    def _refresh_if_stale(self):
+        if not self._stale:
+            return
+        self._stale = False
+        self.refresh()
+        self.main_window.update_status_bar()
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        self._refresh_if_stale()
 
     def _refresh_side_views(self):
         # Rebuild map markers, timeline and status bar after a structural
@@ -763,6 +833,7 @@ class ManagerTab(QWidget):
     def _push_undo(self, op):
         self.redo_stack.clear()
         self.undo_stack.append(op)
+        self._sync_history_buttons()
 
     def _op_list(self, op):
         # Ops are (tag, parent, obj[, idx]); the tag suffix names which
@@ -794,9 +865,13 @@ class ManagerTab(QWidget):
     def undo(self):
         if not self.undo_stack:
             return
-        op = self.undo_stack.pop()
+        # Peek, apply, then move: popping before the apply would lose the
+        # op from both stacks on failure — the mutation would stay while
+        # has_unsaved_changes() could go False.
+        op = self.undo_stack[-1]
         try:
             self._apply_reverse(op)
+            self.undo_stack.pop()
             self.redo_stack.append(op)
         except Exception as e:
             QMessageBox.warning(
@@ -807,9 +882,10 @@ class ManagerTab(QWidget):
     def redo(self):
         if not self.redo_stack:
             return
-        op = self.redo_stack.pop()
+        op = self.redo_stack[-1]
         try:
             self._apply_forward(op)
+            self.redo_stack.pop()
             # Append directly: _push_undo would clear the redo stack.
             self.undo_stack.append(op)
         except Exception as e:
@@ -818,11 +894,21 @@ class ManagerTab(QWidget):
             )
         self._after_history_change()
 
+    def _sync_history_buttons(self):
+        self.undo_btn.setEnabled(bool(self.undo_stack))
+        self.redo_btn.setEnabled(bool(self.redo_stack))
+
+    def clear_history(self):
+        self.undo_stack.clear()
+        self.redo_stack.clear()
+        self._sync_history_buttons()
+
     def _after_history_change(self):
         # refresh() rebuilds the tree, map markers and timeline, but not
         # the status bar.
         self.refresh()
         self.main_window.update_status_bar()
+        self._sync_history_buttons()
 
     def _mark_changed(self):
         # Refresh dependent views after a structural edit; unsaved state

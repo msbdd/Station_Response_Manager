@@ -686,33 +686,53 @@ class TimelineWidget(QWidget):
         self._initial_fit()
 
     def update_timeline(self, loaded_files):
-        self.scene.clear()
-        self._grid_items.clear()
-        self.label_scene.clear()
-        self.axis_scene.clear()
         groups = self.group_stations(loaded_files)
         if not groups:
             self._all_rows = []
+            self._clear_view()
             return
 
         rows = self.build_rows(groups)
         if not rows:
             self._all_rows = []
+            self._clear_view()
             return
 
         self._all_rows = rows
         self._show_rows(self._filter_rows(rows))
 
-    def _show_rows(self, rows):
+    def _clear_view(self):
+        """Empty the timeline and drop everything derived from the old
+        rows.
+
+        Every one of these must go together: leftover ``_rows`` repaint
+        ghost labels on the next scroll and make a double-click activate
+        a deleted station, a stale ``_t_min``/``_span``/``_pps`` plus the
+        surviving sceneRect draw a full time axis and grid over a blank
+        timeline, and a card left showing is never hidden by Qt because
+        the bar under the cursor was destroyed rather than left."""
         self.scene.clear()
         self._grid_items.clear()
         self.label_scene.clear()
         self.axis_scene.clear()
+        self.hover_card.hide()
+        self.scene.setSceneRect(0, 0, 0, 0)
+        self._rows = []
+        self._total_rows = 0
+        self._needs_initial_fit = False
+        for attr in ('_t_min', '_span', '_pps'):
+            if hasattr(self, attr):
+                delattr(self, attr)
 
+    def _show_rows(self, rows):
         if not rows:
-            self._rows = []
-            self._total_rows = 0
+            self._clear_view()
             return
+
+        self.scene.clear()
+        self._grid_items.clear()
+        self.label_scene.clear()
+        self.axis_scene.clear()
 
         all_ts = []
         for r in rows:

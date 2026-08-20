@@ -9,9 +9,8 @@ from PyQt5.QtWidgets import (
     QLineEdit,
     QInputDialog,
     QHBoxLayout,
-    QShortcut,
 )
-from PyQt5.QtGui import QColor, QBrush, QKeySequence
+from PyQt5.QtGui import QColor, QBrush
 from PyQt5.QtCore import Qt
 from obspy import UTCDateTime
 from obspy.core.inventory import Station, Channel
@@ -42,6 +41,18 @@ def _editable_attrs(obj):
     names.sort()
     _FIELDS_CACHE[cls] = names
     return names
+
+
+def notify_inventory_changed(main_window):
+    """Tell the host window an editor mutated the shared inventory.
+
+    The Manager tab renders the same objects, so its tree, map, timeline
+    and issue counts go stale on every edit made here. Optional service:
+    a host that doesn't provide it (a bare harness) simply gets no
+    notification."""
+    notify = getattr(main_window, "mark_inventory_changed", None)
+    if callable(notify):
+        notify()
 
 
 def _identity_index(seq, obj):
@@ -110,15 +121,10 @@ class ExplorerTab(QWidget):
         self.info_label = QLabel(f"Loaded file: {filepath}")
         layout.addWidget(self.info_label)
 
-        self.undo_shortcut = QShortcut(QKeySequence.Undo, self)
-        self.undo_shortcut.setContext(Qt.WidgetWithChildrenShortcut)
-        self.undo_shortcut.activated.connect(self.undo)
-        self.redo_shortcut = QShortcut(QKeySequence("Ctrl+Y"), self)
-        self.redo_shortcut.setContext(Qt.WidgetWithChildrenShortcut)
-        self.redo_shortcut.activated.connect(self.redo)
-        self.redo_shortcut_alt = QShortcut(QKeySequence("Ctrl+Shift+Z"), self)
-        self.redo_shortcut_alt.setContext(Qt.WidgetWithChildrenShortcut)
-        self.redo_shortcut_alt.activated.connect(self.redo)
+        # Undo/redo are driven by the window-level Edit menu, which
+        # dispatches to the current tab: a WidgetWithChildrenShortcut
+        # here would be dead whenever focus sat outside this subtree and
+        # would clash with the menu's shortcuts.
 
     def navigate_to(
         self, net_code, sta_code, chan_code,
@@ -213,9 +219,15 @@ class ExplorerTab(QWidget):
         "historical_code", "restricted_status", "source_id", "start_date",
         "water_level",
     ]
-    # Integer-typed fields whose ObsPy setter validates the value, so a raw
-    # string would raise. Float fields (water_level, clock_drift, ...) are
-    # coerced by ObsPy automatically and need no special handling.
+    # Typed fields, keyed by attribute NAME: their current value can be
+    # None or a seeded placeholder, so branching on the value's type would
+    # miss them — and several have validating ObsPy setters that raise on
+    # a raw string (an unhandled exception in a Qt slot aborts the whole
+    # process under PyQt5).
+    _DATE_FIELDS = {
+        "start_date", "end_date", "creation_date", "termination_date",
+    }
+    _FLOAT_FIELDS = {"water_level", "clock_drift_in_seconds_per_sample"}
     _INT_FIELDS = {"total_number_of_stations"}
 
     def _find_header_item(self, item):
@@ -269,15 +281,28 @@ class ExplorerTab(QWidget):
             if getattr(obj, a, None) in (None, "")
         ]
 
-    @staticmethod
-    def _set_field(obj, field):
-        """Set a missing field, using a non-empty placeholder for fields
-        that ObsPy silently converts empty strings to None."""
+    @classmethod
+    def _set_field(cls, obj, field):
+        """Seed a missing field so an editable row appears for it.
+
+        Typed fields get a typed placeholder: ObsPy's validating setters
+        reject "" outright (date/int/float fields), and a str seed would
+        make handle_tree_edit store untyped text that serializes as
+        garbage and silently vanishes on reload."""
+        if field in cls._DATE_FIELDS:
+            setattr(obj, field, UTCDateTime())
+            return
+        if field in cls._FLOAT_FIELDS:
+            setattr(obj, field, 0.0)
+            return
+        if field in cls._INT_FIELDS:
+            setattr(obj, field, 0)
+            return
         # Try empty string first
         setattr(obj, field, "")
         if getattr(obj, field, None) is not None:
             return
-        # ObsPy swallowed it — use a typed placeholder
+        # ObsPy swallowed it — use a non-empty placeholder
         setattr(obj, field, "—")
 
     def create_new_field(self):
@@ -296,7 +321,10 @@ class ExplorerTab(QWidget):
 
         label = header.text(0)
         obj = self._get_obj_for_header(header)
-        if not obj:
+        # `is None`, not falsiness: ObsPy defines __len__ on Network and
+        # Station as their child count, so a freshly created (still
+        # childless) one is falsy and would be reported as unresolved.
+        if obj is None:
             QMessageBox.warning(self, "Error", "Could not resolve object.")
             return
 
@@ -350,7 +378,16 @@ class ExplorerTab(QWidget):
             new_ref = ("channel", chan)
         else:
             prev_value = getattr(obj, choice, None)
-            self._set_field(obj, choice)
+            try:
+                self._set_field(obj, choice)
+            except Exception as e:
+                # Backstop: letting a setter error escape this clicked
+                # slot would abort the process under PyQt5.
+                QMessageBox.warning(
+                    self, "New Field",
+                    f"Could not create field \"{choice}\": {e}"
+                )
+                return
             self._push_undo(("add_field", obj, choice, prev_value))
         self.populate_tree(self.current_inventory)
         if new_ref is not None:
@@ -453,8 +490,21 @@ class ExplorerTab(QWidget):
             walk(self.tree.topLevelItem(i))
 
     def _find_tree_item_by_data(self, ref):
+        def matches(data):
+            # Payload objects must match by identity: ObsPy objects
+            # compare by value, so `==` would land on the first equal
+            # twin (e.g. the second identical new station would focus —
+            # and then edit — the first one).
+            if not (isinstance(data, tuple) and isinstance(ref, tuple)
+                    and len(data) == len(ref)):
+                return data is ref
+            return all(
+                a is b or (isinstance(a, str) and a == b)
+                for a, b in zip(data, ref)
+            )
+
         def walk(item):
-            if item.data(0, Qt.UserRole) == ref:
+            if matches(item.data(0, Qt.UserRole)):
                 return item
             for i in range(item.childCount()):
                 found = walk(item.child(i))
@@ -746,18 +796,18 @@ class ExplorerTab(QWidget):
 
         old_value = getattr(ref_object, attr, None)
         try:
-            if isinstance(old_value, UTCDateTime):
-                new_value = UTCDateTime(new_value)
-            elif old_value is None and attr in (
-                "start_date", "end_date", "creation_date",
-                "termination_date",
-            ):
-                if new_value.strip():
-                    new_value = UTCDateTime(new_value)
-                else:
-                    new_value = None
-            elif old_value is None and attr in self._INT_FIELDS:
+            # Name-based branches first: the current value may be None or
+            # a placeholder, so its type says nothing about the field's.
+            if attr in self._DATE_FIELDS:
+                new_value = (
+                    UTCDateTime(new_value) if new_value.strip() else None
+                )
+            elif attr in self._INT_FIELDS:
                 new_value = int(new_value) if new_value.strip() else None
+            elif attr in self._FLOAT_FIELDS:
+                new_value = float(new_value) if new_value.strip() else None
+            elif isinstance(old_value, UTCDateTime):
+                new_value = UTCDateTime(new_value)
             elif isinstance(old_value, float):
                 new_value = float(new_value)
             elif isinstance(old_value, int):
@@ -877,6 +927,7 @@ class ExplorerTab(QWidget):
     def _push_undo(self, op):
         self.redo_stack.clear()
         self.undo_stack.append(op)
+        notify_inventory_changed(self.main_window)
 
     def _apply_reverse(self, op):
         tag = op[0]
@@ -963,11 +1014,15 @@ class ExplorerTab(QWidget):
     def undo(self):
         if not self.undo_stack:
             return
-        op = self.undo_stack.pop()
+        # Peek, apply, then move: popping before the apply would lose the
+        # op from both stacks on failure — the mutation would stay while
+        # has_unsaved_changes() could go False.
+        op = self.undo_stack[-1]
         fast = False
         try:
             captured = self._capture_forward(op)
             result = self._apply_reverse(op)
+            self.undo_stack.pop()
             self.redo_stack.append((op, captured))
             if result[0] == "field":
                 _, ref_object, attr, value = result
@@ -982,10 +1037,11 @@ class ExplorerTab(QWidget):
     def redo(self):
         if not self.redo_stack:
             return
-        op, captured = self.redo_stack.pop()
+        op, captured = self.redo_stack[-1]
         fast = False
         try:
             result = self._apply_forward(op, captured)
+            self.redo_stack.pop()
             # Append directly: _push_undo would clear the redo stack.
             self.undo_stack.append(op)
             if result[0] == "field":
@@ -1018,6 +1074,19 @@ class ExplorerTab(QWidget):
             self._apply_modified_style(
                 item, self._values_differ(value, baseline_value)
             )
+            if attr == "code":
+                # filter_tree and navigate_to match on the header text,
+                # so a rename must update it or filtering/navigation
+                # keeps working against the old code.
+                header = item.parent()
+                if header is not None:
+                    text = header.text(0)
+                    for prefix in (
+                        "Network: ", "Station: ", "Channel: ",
+                    ):
+                        if text.startswith(prefix):
+                            header.setText(0, prefix + str(value))
+                            break
         finally:
             self._suppress_edits = False
         return True
