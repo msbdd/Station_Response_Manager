@@ -123,11 +123,19 @@ def combine_resp(sensor_resp, recorder_resp):
             product = stage_gain_product(result.response_stages)
             if product is not None:
                 sens.value = product
-                for s in result.response_stages:
-                    freq = getattr(s, 'normalization_frequency', None)
-                    if freq:
-                        sens.frequency = float(freq)
-                        break
+                # The gain product is the product of values each quoted at
+                # its own stage_gain_frequency, so the only defensible
+                # reference is the first stage's gain frequency. The A0
+                # normalization frequency was used here once: it is the
+                # reference for the poles/zeros normalization factor, not
+                # for the gain, and the two differ on most sensors. When
+                # there is no gain frequency, leave whatever the datalogger
+                # stated rather than inventing one.
+                gain_freq = getattr(
+                    sensor_stages[0], 'stage_gain_frequency', None
+                )
+                if gain_freq is not None:
+                    sens.frequency = float(gain_freq)
                 logger.warning(
                     "Overall sensitivity for input units '%s' cannot be "
                     "recalculated exactly; using the stage gain product "
@@ -340,10 +348,36 @@ def diff_inventory_vs_file(path, inventory):
     return "\n".join(diff)
 
 
+# Spellings of one and the same unit. Only exact synonyms belong here:
+# over-normalizing would hide a real mismatch, which is worse than the
+# false warning this removes. Note mV is deliberately absent — millivolts
+# really are not volts, and the NRL tree uses both.
+_UNIT_ALIASES = {
+    "COUNT": "COUNT", "COUNTS": "COUNT",
+    "V": "V", "VOLT": "V", "VOLTS": "V",
+    "A": "A", "AMPERE": "A", "AMPERES": "A",
+    "PA": "PA", "PASCAL": "PA", "PASCALS": "PA",
+    "M": "M", "METER": "M", "METERS": "M", "METRE": "M", "METRES": "M",
+    "M/S": "M/S", "M/SEC": "M/S",
+    "M/S**2": "M/S**2", "M/(S**2)": "M/S**2", "M/SEC**2": "M/S**2",
+    "M/(SEC**2)": "M/S**2", "M/S/S": "M/S**2",
+}
+
+
+def _canonical_unit(units):
+    """Fold a unit string onto a canonical spelling for comparison."""
+    norm = _norm_unit(units)
+    return _UNIT_ALIASES.get(norm, norm)
+
+
 def _units_equal(a, b):
     # Unit strings are case/whitespace-insensitive (e.g. "M/S" == "m/s"),
-    # matching how the NRL detector normalizes units.
-    return _norm_unit(a) == _norm_unit(b)
+    # matching how the NRL detector normalizes units, and equal spellings
+    # of one unit compare equal. The NRL tree itself carries both "count"
+    # and "counts", so a response combined from two of its branches used
+    # to raise a unit-mismatch warning at exactly the moment the user was
+    # deciding whether to trust the combination.
+    return _canonical_unit(a) == _canonical_unit(b)
 
 
 def validate_response(response):
@@ -393,6 +427,14 @@ def validate_response(response):
             issues.append((
                 "warning",
                 "Instrument sensitivity value is zero or None."
+            ))
+        if sens.frequency is None:
+            # A missing frequency serializes as a literal "None" in the
+            # <Frequency> element, which is invalid StationXML — report it
+            # rather than passing it through to the writer.
+            issues.append((
+                "warning",
+                "Instrument sensitivity has no frequency."
             ))
         first_in = getattr(stages[0], 'input_units', None)
         if (first_in and sens.input_units

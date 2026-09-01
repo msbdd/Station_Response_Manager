@@ -47,6 +47,7 @@ from obspy.core.inventory.response import (
     FIRResponseStage,
     PolynomialResponseStage,
     ResponseListElement,
+    InstrumentSensitivity,
 )
 from obspy.clients.nrl import NRL
 
@@ -72,6 +73,26 @@ _FLOAT_ATTRS = (
     "decimation_correction",
 )
 _INT_ATTRS = ("decimation_factor", "decimation_offset")
+_REQUIRED_SENS_ATTRS = ("value", "frequency", "input_units", "output_units")
+_REQUIRED_STAGE_ATTRS = ("stage_gain", "normalization_frequency")
+
+
+def _required_field_reason(ref_object, attr):
+    """Why ``attr`` on ``ref_object`` may not be cleared, or None."""
+    if isinstance(ref_object, InstrumentSensitivity):
+        required = attr in _REQUIRED_SENS_ATTRS
+        owner = "instrument sensitivity"
+    else:
+        required = attr in _REQUIRED_STAGE_ATTRS
+        owner = "response stage"
+    if not required:
+        return None
+    return (
+        f"\"{attr}\" is required by StationXML on a {owner}. Removing it "
+        "would write an invalid file that other tools (evalresp, SeisComP) "
+        "reject.\n\nEdit the value instead, or delete the whole "
+        f"{owner.split()[-1]}."
+    )
 
 
 def _units_label(stage):
@@ -633,6 +654,17 @@ class ResponseTab(QWidget):
         new_text = item.text(1)
         old_value = getattr(ref_object, attr)
 
+        if not new_text.strip():
+            reason = _required_field_reason(ref_object, attr)
+            if reason:
+                QMessageBox.warning(self, "Cannot Clear Field", reason)
+                self._suppress_edits = True
+                item.setText(
+                    1, "" if old_value is None else str(old_value)
+                )
+                self._suppress_edits = False
+                return
+
         try:
             if isinstance(old_value, float):
                 new_value = float(new_text)
@@ -813,9 +845,20 @@ class ResponseTab(QWidget):
             return
         old_value = sens.value
         old_frequency = sens.frequency
-        note = None
+        notes = []
         try:
-            response.recalculate_overall_sensitivity()
+            if old_frequency is not None:
+                response.recalculate_overall_sensitivity(
+                    frequency=float(old_frequency)
+                )
+            else:
+                response.recalculate_overall_sensitivity()
+                notes.append(
+                    "This response stated no sensitivity frequency, so the "
+                    "reference frequency was chosen automatically as "
+                    f"{sens.frequency} Hz — check that it suits this "
+                    "instrument."
+                )
             # ObsPy returns numpy scalars; keep builtin floats so Qt and
             # serialization never see numpy types.
             sens.value = float(sens.value)
@@ -833,11 +876,13 @@ class ResponseTab(QWidget):
                     "or zero."
                 )
                 return
+            # Value only: the gain product is not evaluated at any single
+            # frequency, so the stated reference stays as it is.
             sens.value = product
-            note = (
+            notes.append(
                 f"Input units '{sens.input_units}' are not supported by "
                 "the exact recalculation; the stage gain product was used "
-                "instead."
+                "instead, and the stated frequency was left unchanged."
             )
         except Exception as e:
             QMessageBox.warning(
@@ -856,8 +901,14 @@ class ResponseTab(QWidget):
             (sens, "frequency", old_frequency),
         ]))
         self.load_response_editor(response)
-        if note:
-            QMessageBox.information(self, "Recalculate Sensitivity", note)
+        summary = (
+            f"Sensitivity: {old_value} @ {old_frequency} Hz\n"
+            f"         →  {sens.value} @ {sens.frequency} Hz"
+        )
+        QMessageBox.information(
+            self, "Recalculate Sensitivity",
+            "\n\n".join([summary] + notes)
+        )
 
     def new(self):
         item = self.stage_tree.currentItem()
@@ -1217,6 +1268,13 @@ class ResponseTab(QWidget):
             # nothing.
             return
 
+        if (isinstance(ref, tuple) and len(ref) == 2
+                and not isinstance(ref[0], str)):
+            reason = _required_field_reason(ref[0], ref[1])
+            if reason:
+                QMessageBox.warning(self, "Cannot Remove Field", reason)
+                return
+
         reply = QMessageBox.question(
             self,
             "Confirm Delete",
@@ -1280,13 +1338,24 @@ class ResponseTab(QWidget):
 
     _UNDO_LIMIT = 100
 
+    def _notify_changed(self):
+        """Mark this file dirty and every other view of it stale.
+
+        Every path that mutates the response has to call this, undo and
+        redo included: a redone edit that is not re-marked dirty is one
+        Save All skips, i.e. silently discards."""
+        notify_inventory_changed(
+            self.main_window,
+            filepath=getattr(self.explorer_tab, "filepath", None),
+        )
+
     def _push_undo(self, op):
         # A new user edit invalidates anything that was undone.
         self.redo_stack.clear()
         self.undo_stack.append(op)
         if len(self.undo_stack) > self._UNDO_LIMIT:
             self.undo_stack = self.undo_stack[-self._UNDO_LIMIT:]
-        notify_inventory_changed(self.main_window)
+        self._notify_changed()
 
     def _stage_index(self, stages, stage):
         """Index of the exact stage, with a value-equality fallback as a
@@ -1472,6 +1541,9 @@ class ResponseTab(QWidget):
             result = self._apply_reverse(op)
             self.undo_stack.pop()
             self.redo_stack.append((op, captured))
+            # The response is already mutated here, so notify before the
+            # row refresh below: a failure there must not lose the mark.
+            self._notify_changed()
             if result[0] == "field":
                 _, ref_object, attr, value = result
                 fast = self._fast_update_field(ref_object, attr, value)
@@ -1500,6 +1572,7 @@ class ResponseTab(QWidget):
             self.redo_stack.pop()
             # Append directly: _push_undo would clear the redo stack.
             self.undo_stack.append(op)
+            self._notify_changed()
             if result[0] == "field":
                 _, ref_object, attr, value = result
                 fast = self._fast_update_field(ref_object, attr, value)

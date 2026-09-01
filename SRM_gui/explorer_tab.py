@@ -16,7 +16,10 @@ from obspy import UTCDateTime
 from obspy.core.inventory import Station, Channel
 from obspy.core.inventory.response import Response
 from SRM_gui.validation_ui import build_issue_items, tint_warning
+import logging
 
+
+logger = logging.getLogger(__name__)
 
 _BASELINE_ROLE = Qt.UserRole + 1
 _FIELDS_CACHE = {}
@@ -43,16 +46,23 @@ def _editable_attrs(obj):
     return names
 
 
-def notify_inventory_changed(main_window):
+def notify_inventory_changed(main_window, filepath=None, source=None):
     """Tell the host window an editor mutated the shared inventory.
 
-    The Manager tab renders the same objects, so its tree, map, timeline
-    and issue counts go stale on every edit made here. Optional service:
+    Every other view of ``filepath`` renders the same objects, so the
+    Manager's tree/map/timeline/issue counts and any sibling Explorer go
+    stale on each edit made here; ``filepath`` also marks the file dirty
+    so Save All knows it has to write it. ``source`` is the view that
+    made the edit, which needs no refresh of its own. Optional service:
     a host that doesn't provide it (a bare harness) simply gets no
     notification."""
     notify = getattr(main_window, "mark_inventory_changed", None)
-    if callable(notify):
-        notify()
+    if not callable(notify):
+        return
+    try:
+        notify(filepath=filepath, source=source)
+    except Exception:
+        logger.exception("Inventory-change notification failed")
 
 
 def _identity_index(seq, obj):
@@ -78,6 +88,7 @@ class ExplorerTab(QWidget):
         self._suppress_edits = False
         self._item_index = {}
         self._baseline_snapshot = {}
+        self._stale = False
 
         layout = QVBoxLayout(self)
 
@@ -229,6 +240,15 @@ class ExplorerTab(QWidget):
     }
     _FLOAT_FIELDS = {"water_level", "clock_drift_in_seconds_per_sample"}
     _INT_FIELDS = {"total_number_of_stations"}
+    _ENUM_FIELDS = {
+        "restricted_status": ("open", "closed", "partial"),
+    }
+    # StationXML types these as anyURI. ObsPy only warns on a bad value and
+    # then writes it anyway, so an unchecked one ships an invalid file — and
+    # the "—" placeholder every other swallowed-"" field gets is itself not
+    # a URI. Seeded with a valid, obviously-placeholder local identifier.
+    _URI_FIELDS = ("source_id",)
+    _URI_PLACEHOLDER = "smi:local/unset"
 
     def _find_header_item(self, item):
         # Walk up to the nearest Network/Station/Channel header
@@ -297,6 +317,9 @@ class ExplorerTab(QWidget):
             return
         if field in cls._INT_FIELDS:
             setattr(obj, field, 0)
+            return
+        if field in cls._URI_FIELDS:
+            setattr(obj, field, cls._URI_PLACEHOLDER)
             return
         # Try empty string first
         setattr(obj, field, "")
@@ -528,8 +551,34 @@ class ExplorerTab(QWidget):
         self.tree.setCurrentItem(item)
         self.tree.scrollToItem(item)
 
+    def mark_stale(self):
+        """Another view edited the inventory this tree renders.
+
+        Without this the tree keeps showing stations the Manager (or a
+        sibling Explorer view of the same file) already deleted: editing
+        one writes to an object that is no longer in the inventory, so
+        the session reports unsaved changes and the save silently drops
+        them. Rebuilding on every keystroke would be far too expensive on
+        a large inventory, so flag it and rebuild when next shown — the
+        same deferral ManagerTab uses."""
+        self._stale = True
+        if self.isVisible():
+            self._refresh_if_stale()
+
+    def _refresh_if_stale(self):
+        if not self._stale:
+            return
+        self._stale = False
+        if self.current_inventory is not None:
+            self.populate_tree(self.current_inventory)
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        self._refresh_if_stale()
+
     def populate_tree(self, inv):
         expanded, selected_path = self._save_tree_state()
+        self._stale = False
         self._suppress_edits = True
         self.tree.setUpdatesEnabled(False)
         self.tree.blockSignals(True)
@@ -813,6 +862,26 @@ class ExplorerTab(QWidget):
             elif isinstance(old_value, int):
                 new_value = int(new_value)
 
+            if attr in self._URI_FIELDS and str(new_value).strip():
+                # ObsPy's own rule: "scheme:path", both parts non-blank.
+                candidate = str(new_value).strip()
+                scheme, _, path = candidate.partition(":")
+                if not (scheme.strip() and path.strip()):
+                    raise ValueError(
+                        "must be a URI, e.g. "
+                        f"{self._URI_PLACEHOLDER} or https://example.org"
+                    )
+                new_value = candidate
+
+            allowed = self._ENUM_FIELDS.get(attr)
+            if allowed is not None and str(new_value).strip():
+                candidate = str(new_value).strip().lower()
+                if candidate not in allowed:
+                    raise ValueError(
+                        "must be one of " + ", ".join(allowed)
+                    )
+                new_value = candidate
+
             setattr(ref_object, attr, new_value)
             self._push_undo(("edit", ref_object, attr, old_value))
 
@@ -924,10 +993,20 @@ class ExplorerTab(QWidget):
             item.setExpanded(True)
         return visible
 
+    def _notify_changed(self):
+        """Mark this file dirty and every other view of it stale.
+
+        Every path that mutates the inventory has to call this, undo and
+        redo included: a redone edit that is not re-marked dirty is one
+        Save All skips, i.e. silently discards."""
+        notify_inventory_changed(
+            self.main_window, filepath=self.filepath, source=self
+        )
+
     def _push_undo(self, op):
         self.redo_stack.clear()
         self.undo_stack.append(op)
-        notify_inventory_changed(self.main_window)
+        self._notify_changed()
 
     def _apply_reverse(self, op):
         tag = op[0]
@@ -1024,6 +1103,9 @@ class ExplorerTab(QWidget):
             result = self._apply_reverse(op)
             self.undo_stack.pop()
             self.redo_stack.append((op, captured))
+            # The inventory is already mutated here, so notify before the
+            # row refresh below: a failure there must not lose the mark.
+            self._notify_changed()
             if result[0] == "field":
                 _, ref_object, attr, value = result
                 fast = self._fast_update_item(ref_object, attr, value)
@@ -1044,6 +1126,7 @@ class ExplorerTab(QWidget):
             self.redo_stack.pop()
             # Append directly: _push_undo would clear the redo stack.
             self.undo_stack.append(op)
+            self._notify_changed()
             if result[0] == "field":
                 _, ref_object, attr, value = result
                 fast = self._fast_update_item(ref_object, attr, value)

@@ -18,7 +18,7 @@ from PyQt5.QtGui import QColor, QBrush
 from PyQt5.QtCore import (
     Qt, QTimer, QUrl, QObject, pyqtSignal, pyqtSlot,
 )
-from SRM_gui.explorer_tab import _identity_index
+from SRM_gui.explorer_tab import _identity_index, notify_inventory_changed
 from SRM_gui.timeline import TimelineWidget
 from SRM_gui.validation_ui import build_issue_items, tint_warning
 import json
@@ -830,9 +830,38 @@ class ManagerTab(QWidget):
         self.update_timeline()
         self.main_window.update_status_bar()
 
+    def _filepath_for_object(self, obj):
+        """Which loaded file owns ``obj`` (an Inventory, Network or
+        Station) — the parent an undo op mutates.
+
+        Identity, not equality: two loaded files can hold equal networks.
+        Undo is LIFO, so an op's parent is always still attached when that
+        op is applied or reversed (a parent's own removal is undone
+        first), which is why this can be resolved lazily instead of being
+        baked into the op tuple."""
+        for fp, inv in self.main_window.loaded_files.items():
+            if inv is obj:
+                return fp
+            for net in inv.networks:
+                if net is obj:
+                    return fp
+                for sta in net.stations:
+                    if sta is obj:
+                        return fp
+        return None
+
+    def _notify_changed(self, op):
+        """Mark the edited file dirty and every other view of it stale."""
+        notify_inventory_changed(
+            self.main_window,
+            filepath=self._filepath_for_object(op[1]),
+            source=self,
+        )
+
     def _push_undo(self, op):
         self.redo_stack.clear()
         self.undo_stack.append(op)
+        self._notify_changed(op)
         self._sync_history_buttons()
 
     def _op_list(self, op):
@@ -873,6 +902,7 @@ class ManagerTab(QWidget):
             self._apply_reverse(op)
             self.undo_stack.pop()
             self.redo_stack.append(op)
+            self._notify_changed(op)
         except Exception as e:
             QMessageBox.warning(
                 self, "Undo Error", f"Failed to undo: {e}"
@@ -888,6 +918,7 @@ class ManagerTab(QWidget):
             self.redo_stack.pop()
             # Append directly: _push_undo would clear the redo stack.
             self.undo_stack.append(op)
+            self._notify_changed(op)
         except Exception as e:
             QMessageBox.warning(
                 self, "Redo Error", f"Failed to redo: {e}"

@@ -24,6 +24,33 @@ from obspy.core.inventory import Station, Network, Channel
 from SRM_gui.response_tab import ResponseSelectionDialog
 
 
+# SEED orientation codes -> (azimuth, dip); None where the code does not
+# determine the value. Z/N/E are fully determined. 1 and 2 name a pair of
+# orthogonal *horizontals* whose absolute azimuth is deliberately not
+# encoded in the code — recording a measured, non-cardinal azimuth is the
+# whole reason an operator picks them over N/E — so the dip is known and
+# the azimuth is not. Any other code determines neither.
+_ORIENTATION = {
+    "Z": (0.0, -90.0),
+    "N": (0.0, 0.0),
+    "E": (90.0, 0.0),
+    "1": (None, 0.0),
+    "2": (None, 0.0),
+}
+
+
+def orientation_for(comp):
+    """(azimuth, dip) implied by a component code; None means unknown.
+
+    Falling back to 0/0 is not a harmless default — it asserts "horizontal,
+    pointing due north", and for a 1/2 pair it asserts that two orthogonal
+    components point the same way. StationXML makes Azimuth and Dip
+    optional exactly so an unknown value can be omitted instead of
+    fabricated.
+    """
+    return _ORIENTATION.get(comp[-1:].upper(), (None, None))
+
+
 class StationInventoryWizard(QDialog):
     def __init__(self, nrl_root, initial_data=None, parent=None):
         super().__init__(parent)
@@ -33,6 +60,7 @@ class StationInventoryWizard(QDialog):
         self.inventory = None
         self.groups = {}
         self.saved_path = None
+        self._unknown_orientations = []
         self._init_ui()
         if initial_data:
             self._populate_from_initial_data(initial_data)
@@ -185,6 +213,8 @@ class StationInventoryWizard(QDialog):
             return
         try:
             self._build_inventory()
+            if not self._confirm_unknown_orientations():
+                return
             default_filename = (
                 f"{self.inventory[0].code}.{self.inventory[0][0].code}.xml"
             )
@@ -207,6 +237,27 @@ class StationInventoryWizard(QDialog):
             QMessageBox.critical(
                 self, "Build Error", f"Failed to build or save inventory:\n{e}"
             )
+
+    def _confirm_unknown_orientations(self):
+        """Tell the user which channels ship without an azimuth.
+
+        Returning False aborts the save so they can rename the components
+        (Z/N/E) or set the azimuth later in the Explorer."""
+        if not self._unknown_orientations:
+            return True
+        names = ", ".join(self._unknown_orientations)
+        reply = QMessageBox.warning(
+            self,
+            "Orientation Not Specified",
+            f"The component code does not define an azimuth for:\n\n"
+            f"  {names}\n\n"
+            "Azimuth will be left unset rather than defaulted to 0 "
+            "(which would claim the channel points due north). You can "
+            "fill it in afterwards in the Explorer tab.\n\nContinue?",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.Yes,
+        )
+        return reply == QMessageBox.Yes
 
     def _validate_inputs(self):
         if not all(
@@ -319,6 +370,9 @@ class StationInventoryWizard(QDialog):
         return locs, comps
 
     def _build_inventory(self):
+        # Channels whose component code does not pin down an azimuth; the
+        # user is told rather than being handed a fabricated 0.
+        self._unknown_orientations = []
         all_channels = []
         all_channels.extend(
             self._build_channels_for_group(self.groups[1], "Group 1")
@@ -361,13 +415,9 @@ class StationInventoryWizard(QDialog):
 
         for i, comp in enumerate(comps):
             code = base + comp
-            az, dip = 0, 0
-            if comp.endswith("E"):
-                az, dip = 90, 0
-            elif comp.endswith("N"):
-                az, dip = 0, 0
-            elif comp.endswith("Z"):
-                az, dip = 0, -90
+            az, dip = orientation_for(comp)
+            if az is None:
+                self._unknown_orientations.append(f"{locs[i]}.{code}")
 
             channels.append(
                 Channel(

@@ -33,20 +33,7 @@ from SRM_gui.dialogs import StationInventoryWizard, ImportFromMiniSEEDDialog
 from SRM_gui.review_dialog import ReviewChangesDialog
 
 
-def save_targets(items, loaded_paths):
-    """Decide where each loaded file is written on a Save All.
-
-    Returns ``(write_items, failures)`` where write_items are
-    ``(source_path, target_path, inventory)`` triples and failures are
-    ``(source_path, message)`` pairs for files that get no job at all.
-
-    ObsPy can only write StationXML, so a non-.xml source (dataless SEED)
-    is redirected to its ``.xml`` sibling and the original is left alone
-    — writing in place would silently replace the SEED bytes under the
-    original name. A redirect that would collide with another loaded
-    file (or another redirect in the same batch) is refused rather than
-    letting one file overwrite another.
-    """
+def save_targets(items, loaded_paths, exists=os.path.exists):
     failures = []
     write_items = []
     claimed = set()
@@ -55,10 +42,18 @@ def save_targets(items, loaded_paths):
             target = fp
         else:
             target = str(Path(fp).with_suffix(".xml"))
+            name = os.path.basename(target)
             if target in loaded_paths or target in claimed:
                 failures.append((fp, (
                     "cannot convert to StationXML: "
-                    f"{os.path.basename(target)} is already loaded"
+                    f"{name} is already loaded"
+                )))
+                continue
+            if exists(target):
+                failures.append((fp, (
+                    "cannot convert to StationXML: "
+                    f"{name} already exists on disk. Rename or move it, "
+                    "or use Export to choose another name."
                 )))
                 continue
         claimed.add(target)
@@ -90,6 +85,7 @@ class MainWindow(QMainWindow):
 
         self.loaded_files = {}
         self.open_tabs = {}
+        self.dirty_paths = set()
 
         self.nrl_root = resource_path(os.path.join("resources", "NRL"))
         while True:
@@ -211,12 +207,32 @@ class MainWindow(QMainWindow):
         )
         view_menu.addAction(close_tab_action)
 
-    def mark_inventory_changed(self):
-        """An Explorer/Response edit changed objects the Manager renders.
+    def mark_inventory_changed(self, filepath=None, source=None):
+        """A view mutated the shared inventory: mark the file dirty and
+        every *other* view of it stale.
 
-        Refreshing the Manager on every keystroke would rebuild the whole
-        tree, so just flag it: the tab rebuilds when it is next shown."""
-        self.manager_tab.mark_stale()
+        Refreshing on every keystroke would rebuild whole trees, so the
+        views only get flagged and rebuild when next shown. ``source`` is
+        the view that made the edit — it already shows the new state.
+        ``filepath`` is None only for a caller that cannot name its file
+        (a bare harness, or a Manager op whose parent has been detached),
+        in which case every file is marked instead. Pessimistic on
+        purpose: an edit that is not marked dirty is an edit Save All
+        skips, i.e. silently discards, so the failure mode has to be a
+        redundant write and never a lost one."""
+        if filepath is not None:
+            self.dirty_paths.add(filepath)
+        else:
+            self.dirty_paths.update(self.loaded_files)
+        if source is not self.manager_tab:
+            self.manager_tab.mark_stale()
+        for key, widget in self.open_tabs.items():
+            if key[0] != "explorer" or not isinstance(widget, ExplorerTab):
+                continue
+            if widget is source:
+                continue
+            if filepath is None or widget.filepath == filepath:
+                widget.mark_stale()
 
     def _dispatch_history(self, action):
         """Route Undo/Redo to the tab the user is looking at.
@@ -275,9 +291,27 @@ class MainWindow(QMainWindow):
         if dialog.exec_() == QDialog.Accepted:
             self.save_all_files(review=False)
 
-    def save_all_files(self, *, review=True):
-        items = list(self.loaded_files.items())
+    def save_all_files(self, *, review=True, report_empty=True):
+        if not self.loaded_files:
+            return
+
+        # Only edited files are written. Rewriting untouched ones churned
+        # their Created/Module provenance, re-serialized multi-hundred-MB
+        # inventories on every Ctrl+S, and — worst — converted an
+        # untouched .dataless to .xml that the user never asked about.
+        items = [
+            (fp, inv) for fp, inv in self.loaded_files.items()
+            if fp in self.dirty_paths
+        ]
         if not items:
+            # Only worth saying on a user-initiated save. On the exit path
+            # it contradicts the "You have unsaved changes" prompt the user
+            # just answered, and blocks shutdown on an extra click.
+            if report_empty:
+                QMessageBox.information(
+                    self, "Save All Files",
+                    "No unsaved changes — nothing was written."
+                )
             return
 
         # Show pending changes before writing anything; the dialog's
@@ -314,6 +348,7 @@ class MainWindow(QMainWindow):
                 [(fp, inv) for fp, _target, inv in write_items],
                 failed_paths, summary
             )
+            self.dirty_paths -= saved_paths
             if fully_saved:
                 self.manager_tab.clear_history()
             for key, widget in self.open_tabs.items():
@@ -570,6 +605,34 @@ class MainWindow(QMainWindow):
                         and t.current_inventory is not None):
                     t._baseline_snapshot = {}
                     t.populate_tree(t.current_inventory)
+            self._drop_clean_dirty_paths()
+
+    def _views_hold_edits(self, filepath):
+        """Does any open view still have unsaved edits for ``filepath``?
+
+        Answers True when unsure. This only ever *removes* a dirty mark, so
+        a wrong False is an edit that Save All skips — i.e. loses — while a
+        wrong True costs one redundant write."""
+        for op in self.manager_tab.undo_stack:
+            owner = self.manager_tab._filepath_for_object(op[1])
+            if owner is None or owner == filepath:
+                return True
+        for key, widget in self.open_tabs.items():
+            if not getattr(widget, "undo_stack", None):
+                continue
+            if key[0] == "explorer" and isinstance(widget, ExplorerTab):
+                if widget.filepath == filepath:
+                    return True
+            elif key[0] == "response" and isinstance(widget, ResponseTab):
+                tab_path = getattr(widget.explorer_tab, "filepath", None)
+                if tab_path == filepath:
+                    return True
+        return False
+
+    def _drop_clean_dirty_paths(self):
+        for fp in list(self.dirty_paths):
+            if not self._views_hold_edits(fp):
+                self.dirty_paths.discard(fp)
 
     def has_unsaved_changes(self):
         if self.manager_tab.undo_stack:
@@ -596,10 +659,17 @@ class MainWindow(QMainWindow):
                 # Skip the review dialog here: rejecting a review would
                 # otherwise close the app with the changes silently
                 # discarded.
-                self.save_all_files(review=False)
-                if self.has_unsaved_changes():
-                    # A failed or cancelled save already showed its own
-                    # warning; refuse to exit so nothing is lost.
+                self.save_all_files(review=False, report_empty=False)
+                # dirty_paths, not has_unsaved_changes(), on purpose: the
+                # Manager's undo stack is global and survives a partial
+                # save, so reading it here would refuse the exit forever
+                # with nothing left to write. This is only safe because
+                # *every* path that mutates an inventory marks the file
+                # dirty — pushes, undo and redo alike (see the tabs'
+                # _notify_changed). A failed or cancelled save already
+                # showed its own warning; refuse to exit so nothing is
+                # lost.
+                if self.dirty_paths:
                     self.statusBar().showMessage(
                         "Exit cancelled — unsaved changes remain.", 5000
                     )
