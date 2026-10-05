@@ -24,12 +24,19 @@ from obspy import read_inventory
 from pathlib import Path
 from obspy.clients.nrl import NRL
 from SRM_core.nrl_index import NRLIndex
+from SRM_core.mseed_scan import (
+    ScanReport,
+    aggregate,
+    list_candidate_files,
+    scan_mseed_file,
+)
 from SRM_gui.index_progress_dialog import IndexProgressDialog
 from SRM_gui.io_progress import IOProgressDialog, IOSummary
 from SRM_gui.manager_tab import ManagerTab
 from SRM_gui.explorer_tab import ExplorerTab
 from SRM_gui.response_tab import ResponseTab
 from SRM_gui.dialogs import StationInventoryWizard, ImportFromMiniSEEDDialog
+from SRM_gui.mseed_batch_dialog import BatchInventoryDialog
 from SRM_gui.review_dialog import ReviewChangesDialog
 
 
@@ -178,6 +185,13 @@ class MainWindow(QMainWindow):
         build_inventory = QAction("Build Inventory", self)
         build_inventory.triggered.connect(self.build_new_inventory)
         tools_menu.addAction(build_inventory)
+        build_from_folder = QAction(
+            "Build Inventories from MiniSEED Folder", self
+        )
+        build_from_folder.triggered.connect(
+            self.build_inventories_from_mseed_folder
+        )
+        tools_menu.addAction(build_from_folder)
         convert_to_xml = QAction("Convert to XML", self)
         convert_to_xml.triggered.connect(self.convert_to_xml)
         tools_menu.addAction(convert_to_xml)
@@ -745,17 +759,100 @@ class MainWindow(QMainWindow):
     def _maybe_load_built_inventory(self, wizard):
         # After the Build Inventory wizard saves a file, offer to load it.
         path = getattr(wizard, "saved_path", None)
-        if not path:
+        self._offer_to_load([path] if path else [])
+
+    def _offer_to_load(self, paths):
+        if not paths:
             return
+        if len(paths) == 1:
+            text = f"Load the created inventory now?\n{paths[0]}"
+        else:
+            text = (
+                f"Load the {len(paths)} created inventories now?\n"
+                f"{os.path.commonpath(paths)}"
+            )
         reply = QMessageBox.question(
             self,
             "Load Inventory",
-            f"Load the created inventory now?\n{path}",
+            text,
             QMessageBox.Yes | QMessageBox.No,
             QMessageBox.Yes,
         )
         if reply == QMessageBox.Yes:
-            self._load_paths_with_progress([path])
+            self._load_paths_with_progress(paths)
+
+    def build_inventories_from_mseed_folder(self):
+        folder = QFileDialog.getExistingDirectory(
+            self, "Select MiniSEED Folder"
+        )
+        if not folder:
+            return
+        paths = list_candidate_files(folder)
+        if not paths:
+            QMessageBox.information(
+                self, "Build Inventories", f"No files found in:\n{folder}"
+            )
+            return
+
+        traces = []
+        not_mseed = []
+        unreadable = []
+        outcome = {}
+
+        def on_result(idx, result, error):
+            # Collect only, for the same reason as in save_all_files.
+            if error is not None:
+                unreadable.append((paths[idx], str(error)))
+            elif result is None:
+                not_mseed.append(paths[idx])
+            else:
+                traces.extend(result)
+
+        def on_done(summary):
+            outcome["summary"] = summary
+
+        jobs = [
+            (
+                f"Scanning {os.path.basename(p)}...",
+                (lambda p=p: scan_mseed_file(p)),
+            )
+            for p in paths
+        ]
+        # _run_jobs blocks until the batch is over, so everything the
+        # callbacks collected is settled below.
+        self._run_jobs("Scanning MiniSEED files", jobs, on_result, on_done)
+
+        summary = outcome.get("summary")
+        if summary is None or summary.canceled:
+            # A partial scan would silently drop whole channels.
+            QMessageBox.information(
+                self, "Build Inventories",
+                "Scan cancelled. Nothing was built."
+            )
+            return
+        report = ScanReport(len(paths), not_mseed, unreadable)
+        stations = aggregate(traces)
+        if not stations:
+            box = QMessageBox(self)
+            box.setIcon(QMessageBox.Information)
+            box.setWindowTitle("Build Inventories")
+            box.setText(f"No MiniSEED data found in:\n{folder}")
+            box.setInformativeText(f"{report.summary()}.")
+            # The skipped-file list can run to thousands of lines; the
+            # detailed-text pane scrolls instead of growing the box.
+            if not_mseed or unreadable:
+                box.setDetailedText(report.details())
+            box.exec_()
+            return
+
+        dialog = BatchInventoryDialog(
+            folder, stations, report, self.nrl_root,
+            loaded_paths=self.loaded_files, parent=self,
+        )
+        dialog.exec_()
+        # Offered even after a cancel: files written by an earlier attempt
+        # in the dialog are on disk all the same.
+        self._offer_to_load(dialog.saved_paths)
 
     def convert_to_xml(self):
         input_path, _ = QFileDialog.getOpenFileName(

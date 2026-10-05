@@ -252,6 +252,33 @@ def convert_inventory_to_xml(input_path: str, output_path: str):
         return False, error_message
 
 
+# SEED orientation codes -> (azimuth, dip); None where the code does not
+# determine the value. Z/N/E are fully determined. 1 and 2 name a pair of
+# orthogonal *horizontals* whose absolute azimuth is deliberately not
+# encoded in the code — recording a measured, non-cardinal azimuth is the
+# whole reason an operator picks them over N/E — so the dip is known and
+# the azimuth is not. Any other code determines neither.
+_ORIENTATION = {
+    "Z": (0.0, -90.0),
+    "N": (0.0, 0.0),
+    "E": (90.0, 0.0),
+    "1": (None, 0.0),
+    "2": (None, 0.0),
+}
+
+
+def orientation_for(comp):
+    """(azimuth, dip) implied by a component code; None means unknown.
+
+    Falling back to 0/0 is not a harmless default — it asserts "horizontal,
+    pointing due north", and for a 1/2 pair it asserts that two orthogonal
+    components point the same way. StationXML makes Azimuth and Dip
+    optional exactly so an unknown value can be omitted instead of
+    fabricated.
+    """
+    return _ORIENTATION.get(comp[-1:].upper(), (None, None))
+
+
 def make_export_inventory(item_type, obj, network=None, station=None,
                           inventory=None,
                           source="Station Response Manager"):

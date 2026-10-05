@@ -17,38 +17,13 @@ from PyQt5.QtWidgets import (
 )
 from PyQt5.QtCore import QDateTime
 from copy import deepcopy
-from SRM_core.utils import wrap_text, atomic_write_inventory
+from SRM_core.utils import (
+    wrap_text, atomic_write_inventory, orientation_for,
+)
 import os
 from obspy import Inventory, UTCDateTime, read
 from obspy.core.inventory import Station, Network, Channel
 from SRM_gui.response_tab import ResponseSelectionDialog
-
-
-# SEED orientation codes -> (azimuth, dip); None where the code does not
-# determine the value. Z/N/E are fully determined. 1 and 2 name a pair of
-# orthogonal *horizontals* whose absolute azimuth is deliberately not
-# encoded in the code — recording a measured, non-cardinal azimuth is the
-# whole reason an operator picks them over N/E — so the dip is known and
-# the azimuth is not. Any other code determines neither.
-_ORIENTATION = {
-    "Z": (0.0, -90.0),
-    "N": (0.0, 0.0),
-    "E": (90.0, 0.0),
-    "1": (None, 0.0),
-    "2": (None, 0.0),
-}
-
-
-def orientation_for(comp):
-    """(azimuth, dip) implied by a component code; None means unknown.
-
-    Falling back to 0/0 is not a harmless default — it asserts "horizontal,
-    pointing due north", and for a 1/2 pair it asserts that two orthogonal
-    components point the same way. StationXML makes Azimuth and Dip
-    optional exactly so an unknown value can be omitted instead of
-    fabricated.
-    """
-    return _ORIENTATION.get(comp[-1:].upper(), (None, None))
 
 
 class StationInventoryWizard(QDialog):

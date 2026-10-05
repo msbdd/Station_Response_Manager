@@ -98,6 +98,10 @@ In Response tab:
 - Tools > Build Inventory:
 	- Creates a new inventory via a wizard.
 	- Can optionally start from a miniSEED file to pre-fill station/channel basics.
+- Tools > Build Inventories from MiniSEED Folder:
+	- Scans a folder (including subfolders) of miniSEED data and builds placeholder StationXML for every station and channel found, with sample rates and epochs taken from the data.
+	- Responses are chosen per channel group (e.g. `00.HH? @ 100 Hz`) or one response for all groups. Channels without one get an empty response to fill in later in the Response tab.
+	- Saves one combined file or one `NET.STA.xml` per station
 - Tools > Convert to XML:
 	- Converts dataless/RESP input to StationXML output.
 
