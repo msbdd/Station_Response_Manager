@@ -26,6 +26,10 @@ from obspy.core.inventory import Station, Network, Channel
 from SRM_gui.response_tab import ResponseSelectionDialog
 
 
+_COMPONENTS_TIP = "Comma-separated channel endings (e.g., Z,N,E or 1,2,Z)"
+_FULL_CODES_TIP = "Comma-separated full channel codes (e.g., Z,NS,EW)"
+
+
 class StationInventoryWizard(QDialog):
     def __init__(self, nrl_root, initial_data=None, parent=None):
         super().__init__(parent)
@@ -95,16 +99,22 @@ class StationInventoryWizard(QDialog):
     def _create_channel_group_widgets(self):
         loc_edit = QLineEdit("00")
         loc_edit.setToolTip(
-            "One code for all, or a comma-separated list per component."
+            "One code for all, or a comma-separated list per component.\n"
+            "Leave blank or use -- for an empty location code."
         )
         comp_edit = QLineEdit("Z,N,E")
-        comp_edit.setToolTip(
-            "Comma-separated channel endings (e.g., Z,N,E or 1,2,Z)"
+        comp_edit.setToolTip(_COMPONENTS_TIP)
+        full_codes_cb = QCheckBox("Full channel codes")
+        full_codes_cb.setToolTip(
+            "Type each whole channel code (e.g., Z,NS,EW) instead of a "
+            "base code + components, for names outside the SEED scheme."
         )
 
-        return {
+        widgets = {
             "loc": loc_edit,
+            "full_codes": full_codes_cb,
             "base": QLineEdit("HH"),
+            "comp_label": QLabel("Channel Components:"),
             "comp": comp_edit,
             "depth": QLineEdit("0.0"),
             "rate": QLineEdit("100.0"),
@@ -114,13 +124,27 @@ class StationInventoryWizard(QDialog):
             "response_obj": None,
             "response_info": "Not Selected",
         }
+        full_codes_cb.toggled.connect(
+            lambda checked: self._set_full_codes_mode(widgets, checked)
+        )
+        return widgets
+
+    def _set_full_codes_mode(self, widgets, full):
+        widgets["base"].setEnabled(not full)
+        widgets["comp_label"].setText(
+            "Channel Codes:" if full else "Channel Components:"
+        )
+        widgets["comp"].setToolTip(
+            _FULL_CODES_TIP if full else _COMPONENTS_TIP
+        )
 
     def _create_layout_from_widgets(self, widgets):
         layout = QFormLayout()
         widgets["date"].setDisplayFormat("yyyy-MM-dd HH:mm:ss")
         layout.addRow("Location Code(s):", widgets["loc"])
+        layout.addRow("", widgets["full_codes"])
         layout.addRow("Channel Base Code:", widgets["base"])
-        layout.addRow("Channel Components:", widgets["comp"])
+        layout.addRow(widgets["comp_label"], widgets["comp"])
         layout.addRow("Start Date:", widgets["date"])
         layout.addRow("Sensor Depth (m):", widgets["depth"])
         layout.addRow("Sample Rate (Hz):", widgets["rate"])
@@ -138,6 +162,9 @@ class StationInventoryWizard(QDialog):
         if "group1" in data:
             g1_data = data["group1"]
             self.groups[1]["loc"].setText(g1_data.get("locs", ""))
+            self.groups[1]["full_codes"].setChecked(
+                g1_data.get("full_codes", False)
+            )
             self.groups[1]["base"].setText(g1_data.get("base", ""))
             self.groups[1]["comp"].setText(g1_data.get("comps", ""))
             self.groups[1]["rate"].setText(g1_data.get("rate", "100.0"))
@@ -145,6 +172,9 @@ class StationInventoryWizard(QDialog):
             self.toggle_group2_cb.setChecked(True)
             g2_data = data["group2"]
             self.groups[2]["loc"].setText(g2_data.get("locs", ""))
+            self.groups[2]["full_codes"].setChecked(
+                g2_data.get("full_codes", False)
+            )
             self.groups[2]["base"].setText(g2_data.get("base", ""))
             self.groups[2]["comp"].setText(g2_data.get("comps", ""))
             self.groups[2]["rate"].setText(g2_data.get("rate", "100.0"))
@@ -224,7 +254,7 @@ class StationInventoryWizard(QDialog):
         reply = QMessageBox.warning(
             self,
             "Orientation Not Specified",
-            f"The component code does not define an azimuth for:\n\n"
+            f"The channel code does not define an azimuth for:\n\n"
             f"  {names}\n\n"
             "Azimuth will be left unset rather than defaulted to 0 "
             "(which would claim the channel points due north). You can "
@@ -295,15 +325,29 @@ class StationInventoryWizard(QDialog):
         return True
 
     def _parse_channel_group(self, widgets, group_name):
-        if not all(
-            [
-                widgets["loc"].text(),
-                widgets["base"].text(),
-                widgets["comp"].text(),
-            ]
-        ):
+        """``(locs, codes)``: one location and one full channel code per
+        channel. With "Full channel codes" ticked the list is taken as
+        typed (e.g. Z,NS,EW); otherwise each entry is a component appended
+        to the base code."""
+        full = widgets["full_codes"].isChecked()
+        base = "" if full else widgets["base"].text().strip().upper()
+        comps = [
+            c.strip().upper()
+            for c in widgets["comp"].text().split(",")
+            if c.strip()
+        ]
+        if not comps:
             raise ValueError(
-                f"{group_name}: All channel code fields are required."
+                f"{group_name}: At least one Channel Code is required."
+                if full else
+                f"{group_name}: Channel Base Code and Channel Components"
+                f" are required."
+            )
+        if not base and not full:
+            raise ValueError(
+                f"{group_name}: Channel Base Code and Channel Components"
+                f" are required. Tick \"Full channel codes\" to enter"
+                f" channel names without a base code."
             )
         if not widgets["response_obj"]:
             raise ValueError(
@@ -324,25 +368,23 @@ class StationInventoryWizard(QDialog):
                 f"{group_name}: Sensor Depth must be a valid number."
             )
 
+        # "--" is the usual spelling of the empty location code; a blank
+        # field means an empty location code for every channel.
         locs = [
-            loc.strip().upper()
+            "" if loc.strip() == "--" else loc.strip().upper()
             for loc in widgets["loc"].text().split(",")
             if loc.strip()
-        ]
-        comps = [
-            c.strip().upper()
-            for c in widgets["comp"].text().split(",")
-            if c.strip()
-        ]
+        ] or [""]
 
         if len(locs) != 1 and len(locs) != len(comps):
             raise ValueError(
                 f"{group_name}: The number of Location Codes must"
-                f" be 1 or match the number of Channel Components."
+                f" be 1 or match the number of"
+                f" {'Channel Codes' if full else 'Channel Components'}."
             )
         if len(locs) == 1 and len(comps) > 1:
             locs = locs * len(comps)
-        return locs, comps
+        return locs, [base + c for c in comps]
 
     def _build_inventory(self):
         # Channels whose component code does not pin down an azimuth; the
@@ -376,8 +418,7 @@ class StationInventoryWizard(QDialog):
 
     def _build_channels_for_group(self, widgets, group_name):
         channels = []
-        locs, comps = self._parse_channel_group(widgets, group_name)
-        base = widgets["base"].text().upper()
+        locs, codes = self._parse_channel_group(widgets, group_name)
 
         station_lat = float(self.lat_edit.text())
         station_lon = float(self.lon_edit.text())
@@ -388,16 +429,15 @@ class StationInventoryWizard(QDialog):
         start_date = UTCDateTime(widgets["date"].dateTime().toPyDateTime())
         response = widgets["response_obj"]
 
-        for i, comp in enumerate(comps):
-            code = base + comp
-            az, dip = orientation_for(comp)
+        for loc, code in zip(locs, codes):
+            az, dip = orientation_for(code)
             if az is None:
-                self._unknown_orientations.append(f"{locs[i]}.{code}")
+                self._unknown_orientations.append(f"{loc or '--'}.{code}")
 
             channels.append(
                 Channel(
                     code=code,
-                    location_code=locs[i],
+                    location_code=loc,
                     latitude=station_lat,
                     longitude=station_lon,
                     elevation=station_ele,
@@ -460,12 +500,16 @@ class ImportFromMiniSEEDDialog(QDialog):
                 )
                 return
             stream = [tr for tr in stream if len(tr.data) > 0]
+            # SEED codes group by band code. Other names (Z, NS, EW...)
+            # carry no band code, so they group by sample rate, the one
+            # thing a wizard group's channels must share, and go in as
+            # full channel codes.
+            seed_names = all(len(tr.stats.channel) == 3 for tr in stream)
             grouped_channels = {}
             for tr in stream:
-                band_code = tr.stats.channel[0]
-                if band_code not in grouped_channels:
-                    grouped_channels[band_code] = []
-                grouped_channels[band_code].append(tr)
+                key = (tr.stats.channel[0] if seed_names
+                       else tr.stats.sampling_rate)
+                grouped_channels.setdefault(key, []).append(tr)
 
             first_trace = stream[0]
             self.initial_data = {
@@ -476,11 +520,13 @@ class ImportFromMiniSEEDDialog(QDialog):
             group_keys = sorted(grouped_channels.keys())
             if len(group_keys) > 0:
                 self.initial_data["group1"] = self._process_channel_group(
-                    grouped_channels[group_keys[0]]
+                    grouped_channels[group_keys[0]],
+                    full_codes=not seed_names,
                 )
             if len(group_keys) > 1:
                 self.initial_data["group2"] = self._process_channel_group(
-                    grouped_channels[group_keys[1]]
+                    grouped_channels[group_keys[1]],
+                    full_codes=not seed_names,
                 )
 
             super().accept()
@@ -489,24 +535,27 @@ class ImportFromMiniSEEDDialog(QDialog):
                 self, "Read Error", f"Could not read or parse the file:\n{e}"
             )
 
-    def _process_channel_group(self, traces):
+    def _process_channel_group(self, traces, full_codes=False):
         chan_info = sorted(
             list(set((tr.stats.location, tr.stats.channel) for tr in traces)),
             key=lambda x: x[1],
         )
 
-        locs = [info[0] for info in chan_info]
+        # The wizard reads "--" as the empty location code.
+        locs = [info[0] or "--" for info in chan_info]
         chan_codes = [info[1] for info in chan_info]
 
-        base = (
-            os.path.commonprefix(chan_codes)
-            if len(chan_codes) > 1
-            else chan_codes[0][:2]
-        )
-        comps = [ch.replace(base, "", 1) for ch in chan_codes]
+        if full_codes:
+            base, comps = "", chan_codes
+        else:
+            # At most two letters, so every component keeps its last
+            # letter, also when one code repeats at two locations.
+            base = os.path.commonprefix(chan_codes)[:2]
+            comps = [ch[len(base):] for ch in chan_codes]
 
         return {
             "locs": ",".join(locs),
+            "full_codes": full_codes,
             "base": base,
             "comps": ",".join(comps),
             "rate": str(traces[0].stats.sampling_rate) if traces else "100.0",
