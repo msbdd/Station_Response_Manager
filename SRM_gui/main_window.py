@@ -9,7 +9,7 @@ from PyQt5.QtWidgets import (
     QTabBar,
     QLabel,
 )
-from PyQt5.QtCore import QSettings
+from PyQt5.QtCore import QSettings, Qt
 from PyQt5.QtGui import QKeySequence
 from SRM_core.utils import (
     resource_path,
@@ -17,6 +17,7 @@ from SRM_core.utils import (
     atomic_write_inventory,
     count_channels_with_issues,
 )
+import html
 import os
 import sys
 from obspy import Inventory
@@ -38,6 +39,7 @@ from SRM_gui.response_tab import ResponseTab
 from SRM_gui.dialogs import StationInventoryWizard, ImportFromMiniSEEDDialog
 from SRM_gui.mseed_batch_dialog import BatchInventoryDialog
 from SRM_gui.review_dialog import ReviewChangesDialog
+from SRM_gui.validation_ui import WARNING_COLOR
 
 
 def save_targets(items, loaded_paths, exists=os.path.exists):
@@ -135,6 +137,9 @@ class MainWindow(QMainWindow):
         self.setup_menu()
         self.setup_ui()
         self._status_label = QLabel()
+        # Rich text so the issue count can be a link to the filtered view.
+        self._status_label.setTextFormat(Qt.RichText)
+        self._status_label.linkActivated.connect(self._show_issue_stations)
         self.statusBar().addPermanentWidget(self._status_label, 1)
         self.update_status_bar()
 
@@ -201,6 +206,16 @@ class MainWindow(QMainWindow):
         toggle_theme.triggered.connect(self.toggle_theme)
         view_menu.addAction(toggle_theme)
         view_menu.addSeparator()
+        # Window-wide: filters the Manager's tree, map and timeline and
+        # every Explorer, including ones opened while it is on.
+        self.issues_only_action = QAction(
+            "Show Only Stations with Metadata Issues", self
+        )
+        self.issues_only_action.setCheckable(True)
+        self.issues_only_action.setShortcut("Ctrl+I")
+        self.issues_only_action.toggled.connect(self._on_issues_only_toggled)
+        view_menu.addAction(self.issues_only_action)
+        view_menu.addSeparator()
         font_increase = QAction("Increase Font Size", self)
         font_increase.setShortcut("Ctrl+=")
         font_increase.triggered.connect(lambda: self._change_font_size(1))
@@ -247,6 +262,12 @@ class MainWindow(QMainWindow):
                 continue
             if filepath is None or widget.filepath == filepath:
                 widget.mark_stale()
+
+    def _on_issues_only_toggled(self, on):
+        self.manager_tab.set_issues_only(on)
+        for key, widget in self.open_tabs.items():
+            if key[0] == "explorer" and isinstance(widget, ExplorerTab):
+                widget.set_issues_only(on)
 
     def _dispatch_history(self, action):
         """Route Undo/Redo to the tab the user is looking at.
@@ -520,6 +541,8 @@ class MainWindow(QMainWindow):
                     return widget
 
         explorer = ExplorerTab(filepath=filepath, main_window=self)
+        # Before the first build, so it comes up already filtered.
+        explorer.set_issues_only(self.issues_only_action.isChecked())
         explorer.current_inventory = inventory
         explorer.populate_tree(inventory)
 
@@ -928,12 +951,19 @@ class MainWindow(QMainWindow):
                 paths.append(p)
         self._load_paths_with_progress(paths)
 
+    def _show_issue_stations(self, _href=None):
+        """Status-bar issue count clicked: show those stations."""
+        self.tabs.setCurrentWidget(self.manager_tab)
+        self.issues_only_action.setChecked(True)
+
     def update_status_bar(self):
+        # The label renders rich text: escape the plain parts.
         n_files = len(self.loaded_files)
         if n_files == 0:
-            self._status_label.setText(
+            self._status_label.setText(html.escape(
                 "No data loaded \u2014 use File > Add Data or drag files here"
-            )
+            ))
+            self._status_label.setToolTip("")
             return
         n_nets = 0
         n_stas = 0
@@ -946,7 +976,7 @@ class MainWindow(QMainWindow):
                 for sta in net.stations:
                     n_stas += 1
                     n_chans += len(sta.channels)
-        text = (
+        text = html.escape(
             f"{n_files} file{'s' if n_files != 1 else ''} | "
             f"{n_nets} network{'s' if n_nets != 1 else ''} | "
             f"{n_stas} station{'s' if n_stas != 1 else ''} | "
@@ -954,7 +984,12 @@ class MainWindow(QMainWindow):
         )
         if n_issues:
             text += (
-                f"  ⚠ {n_issues} channel"
-                f"{'s' if n_issues != 1 else ''} with metadata issues"
+                f'&nbsp;&nbsp;<a href="issues" style="color: '
+                f'{WARNING_COLOR};">⚠ {n_issues} channel'
+                f"{'s' if n_issues != 1 else ''} with metadata issues</a>"
             )
         self._status_label.setText(text)
+        self._status_label.setToolTip(
+            "Click the ⚠ count to show only those stations"
+            if n_issues else ""
+        )

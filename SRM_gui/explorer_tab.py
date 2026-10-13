@@ -15,7 +15,9 @@ from PyQt5.QtCore import Qt
 from obspy import UTCDateTime
 from obspy.core.inventory import Station, Channel
 from obspy.core.inventory.response import Response
-from SRM_gui.validation_ui import build_issue_items, tint_warning
+from SRM_gui.validation_ui import (
+    build_issue_items, flag_issue, has_issue_flag,
+)
 import logging
 
 
@@ -77,6 +79,28 @@ def _identity_index(seq, obj):
     return None
 
 
+def _is_hidden(item):
+    """Whether ``item`` is invisible: it or one of its ancestors is hidden."""
+    while item is not None:
+        if item.isHidden():
+            return True
+        item = item.parent()
+    return False
+
+
+def _clear_hidden_current(tree):
+    """Clear ``tree``'s current row if a filter has hidden it.
+
+    Qt keeps a hidden row current, and the views' buttons act on
+    currentItem(): Delete would remove a row the user cannot see.
+    Returns whether anything was cleared."""
+    if not _is_hidden(tree.currentItem()):
+        return False
+    tree.clearSelection()
+    tree.setCurrentItem(None)
+    return True
+
+
 class ExplorerTab(QWidget):
     def __init__(self, filepath, main_window):
         super().__init__()
@@ -89,6 +113,8 @@ class ExplorerTab(QWidget):
         self._item_index = {}
         self._baseline_snapshot = {}
         self._stale = False
+        # Window-wide View > Show Only Stations with Metadata Issues.
+        self._issues_only = False
 
         layout = QVBoxLayout(self)
 
@@ -150,8 +176,7 @@ class ExplorerTab(QWidget):
                 continue
             net_item.setExpanded(True)
             if not sta_code:
-                self.tree.setCurrentItem(net_item)
-                self.tree.scrollToItem(net_item)
+                self._select_shown(net_item)
                 return
 
             # A station code may appear multiple times under the same
@@ -164,13 +189,16 @@ class ExplorerTab(QWidget):
             ]
             if not sta_items:
                 return
+            # When filtering hides some of the blocks, land on a shown one.
+            first_sta = next(
+                (s for s in sta_items if not _is_hidden(s)), sta_items[0]
+            )
 
             for s in sta_items:
                 s.setExpanded(True)
 
             if not chan_code:
-                self.tree.setCurrentItem(sta_items[0])
-                self.tree.scrollToItem(sta_items[0])
+                self._select_shown(first_sta)
                 return
 
             best_item = None
@@ -202,14 +230,55 @@ class ExplorerTab(QWidget):
 
             if best_item:
                 best_item.setExpanded(True)
-                self.tree.setCurrentItem(best_item)
-                self.tree.scrollToItem(best_item)
+                self._select_shown(best_item)
                 return
 
             # Channel not found in any matching station — fall back.
-            self.tree.setCurrentItem(sta_items[0])
-            self.tree.scrollToItem(sta_items[0])
+            self._select_shown(first_sta)
             return
+
+    def reveal(self, ref):
+        """Select and scroll to the row of ``ref``, a ("station", sta) or
+        ("channel", chan) tuple taken from another view of this inventory.
+
+        Matched by identity rather than by code (as navigate_to does), so
+        the right block is found even when epochs share a code. A row the
+        filters hide is shown anyway (see _show_despite_filters). Returns
+        whether the row was found."""
+        self._refresh_if_stale()
+        item = self._find_tree_item_by_data(ref)
+        if item is None:
+            return False
+        self._show_despite_filters(item)
+        self._focus_tree_item(item)
+        return True
+
+    def _select_shown(self, item):
+        self._show_despite_filters(item)
+        self.tree.setCurrentItem(item)
+        self.tree.scrollToItem(item)
+
+    def _show_despite_filters(self, item):
+        """Unhide ``item``, with its whole station, if the filters hide it.
+
+        A row the user navigated to from another view must not end up
+        selected but invisible. Clearing the filters instead would throw
+        away typed filter text, and the issues-only filter is window-wide
+        (View menu); the next filter pass simply re-applies them."""
+        if not _is_hidden(item):
+            return
+        node = item
+        while node is not None:
+            data = node.data(0, Qt.UserRole)
+            if (isinstance(data, tuple) and data
+                    and isinstance(data[0], str) and data[0] == "station"):
+                self._filter_prop(node, "")  # unhides the whole subtree
+                break
+            node = node.parent()
+        node = item
+        while node is not None:
+            node.setHidden(False)
+            node = node.parent()
 
     # Editable fields per type — from ObsPy's actual attributes
     # This needs to be changed if moved to a different ObsPy version...
@@ -690,22 +759,23 @@ class ExplorerTab(QWidget):
                         warn_item = build_issue_items(chan, two_columns=True)
                         if warn_item is not None:
                             chan_item.insertChild(0, warn_item)
-                            tint_warning(chan_item)
+                            flag_issue(chan_item)
                             sta_has_issues = True
 
                     if sta_has_issues:
-                        tint_warning(sta_item)
+                        flag_issue(sta_item)
                         net_has_issues = True
 
                 if net_has_issues:
-                    tint_warning(net_item)
+                    flag_issue(net_item)
         except Exception as e:
             QTreeWidgetItem(self.tree, ["Error", str(e)])
         try:
             if expanded or selected_path:
                 self._restore_tree_state(expanded, selected_path)
             if (self.station_filter.text().strip()
-                    or self.search_bar.text().strip()):
+                    or self.search_bar.text().strip()
+                    or self._issues_only):
                 self.filter_tree()
         finally:
             # Always re-enable, or one exception above would leave the
@@ -942,9 +1012,24 @@ class ExplorerTab(QWidget):
                 explorer_tab=self,
             )
 
+    def set_issues_only(self, on):
+        """Show only stations with metadata issues, or all of them.
+
+        Driven by the window-wide View menu toggle. With no on-screen
+        checkbox, the tree header says when the filter is on."""
+        on = bool(on)
+        if on == self._issues_only:
+            return
+        self._issues_only = on
+        self.tree.headerItem().setText(
+            0, "Field (issues only)" if on else "Field"
+        )
+        self.filter_tree()
+
     def filter_tree(self):
         sta_text = self.station_filter.text().strip().upper()
         prop_text = self.search_bar.text().lower()
+        issues_only = self._issues_only
 
         for ni in range(self.tree.topLevelItemCount()):
             net_item = self.tree.topLevelItem(ni)
@@ -961,6 +1046,8 @@ class ExplorerTab(QWidget):
                     continue
                 sta_code = label.replace("Station: ", "").strip()
                 sta_visible = net_matches or sta_text in sta_code.upper()
+                if issues_only and not has_issue_flag(sta_item):
+                    sta_visible = False
 
                 if sta_visible:
                     # Station matched — apply property filter inside
@@ -969,9 +1056,17 @@ class ExplorerTab(QWidget):
                 else:
                     sta_item.setHidden(True)
 
-            net_item.setHidden(not (net_matches or any_sta_visible))
-            if (net_matches or any_sta_visible) and sta_text:
+            # A matching network code alone keeps the network shown, which
+            # would leave all-clean networks up when only issues are wanted.
+            net_visible = any_sta_visible or (net_matches and not issues_only)
+            net_item.setHidden(not net_visible)
+            if net_visible and (sta_text or issues_only):
                 net_item.setExpanded(True)
+
+        if _clear_hidden_current(self.tree):
+            # Re-sync New/Delete directly: inside populate_tree the tree's
+            # signals are blocked, so itemSelectionChanged never fires.
+            self.on_tree_selection_changed()
 
     def _filter_prop(self, item, prop_text):
         # Apply property text filter recursively. Show all if empty."""

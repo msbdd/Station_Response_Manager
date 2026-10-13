@@ -364,6 +364,9 @@ class TimelineWidget(QWidget):
         self._total_rows = 0
         self._needs_initial_fit = False
         self._grid_items = []
+        # Set of (NET.STA, filepath) group keys to restrict the rows to —
+        # the host's issues-only filter — or None for no restriction.
+        self.issue_groups = None
 
         self.btn_zin.clicked.connect(self.view.zoom_in)
         self.btn_zout.clicked.connect(self.view.zoom_out)
@@ -797,6 +800,8 @@ class TimelineWidget(QWidget):
         self._show_rows(self._filter_rows(self._all_rows))
 
     def _filter_rows(self, rows):
+        if self.issue_groups is not None:
+            rows = [r for r in rows if r['group'] in self.issue_groups]
         pattern = self.filter_bar.text().strip()
         if not pattern:
             return rows

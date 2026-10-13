@@ -18,9 +18,13 @@ from PyQt5.QtGui import QColor, QBrush
 from PyQt5.QtCore import (
     Qt, QTimer, QUrl, QObject, pyqtSignal, pyqtSlot,
 )
-from SRM_gui.explorer_tab import _identity_index, notify_inventory_changed
+from SRM_gui.explorer_tab import (
+    _clear_hidden_current, _identity_index, notify_inventory_changed,
+)
 from SRM_gui.timeline import TimelineWidget
-from SRM_gui.validation_ui import build_issue_items, tint_warning
+from SRM_gui.validation_ui import (
+    build_issue_items, flag_issue, has_issue_flag,
+)
 import json
 import colorsys
 from obspy import Inventory
@@ -28,6 +32,11 @@ from obspy.core.inventory import Station, Channel
 from obspy.core.inventory.response import Response
 import os
 from pathlib import Path
+
+
+def _marker_key(filepath, net_idx, sta_idx):
+    # Must match the key map_template.html builds for markersByKey.
+    return "{}|{}|{}".format(filepath, net_idx, sta_idx)
 
 
 class MapBridge(QObject):
@@ -50,6 +59,8 @@ class ManagerTab(QWidget):
         self.undo_stack = []
         self.redo_stack = []
         self._stale = False
+        # Window-wide View > Show Only Stations with Metadata Issues.
+        self._issues_only = False
         splitter = QSplitter(Qt.Horizontal)
         left_widget = QWidget()
         left_layout = QVBoxLayout(left_widget)
@@ -204,6 +215,7 @@ class ManagerTab(QWidget):
             self._station_markers_for_file(abs_filepath, inventory)
         )
         if not defer_side_views:
+            self._apply_issue_filter()
             self._push_markers()
             self.update_timeline()
 
@@ -229,8 +241,84 @@ class ManagerTab(QWidget):
         return markers
 
     def _push_markers(self):
-        js_code = f"addStations({json.dumps(self.all_stations)});"
+        stations = self.all_stations
+        if self._issues_only:
+            keys = {
+                _marker_key(fp, ni, si)
+                for fp, ni, si, _net, _sta in self._flagged_stations()
+            }
+            stations = [
+                m for m in stations
+                if _marker_key(m["file"], m["net_idx"], m["sta_idx"]) in keys
+            ]
+        js_code = f"addStations({json.dumps(stations)});"
         self.map_view.page().runJavaScript(js_code)
+
+    def _flagged_stations(self):
+        """Yield ``(filepath, net_idx, sta_idx, network, station)`` for each
+        station row carrying the issue flag — the rows the issues-only tree
+        shows. Indices are tree positions, which mirror inventory indices,
+        so they are the map's marker keys too."""
+        for fi in range(self.file_tree.topLevelItemCount()):
+            file_item = self.file_tree.topLevelItem(fi)
+            file_data = file_item.data(0, Qt.UserRole)
+            if not file_data or file_data[0] != "file":
+                continue
+            for ni in range(file_item.childCount()):
+                net_item = file_item.child(ni)
+                net = net_item.data(0, Qt.UserRole)[1]
+                for si in range(net_item.childCount()):
+                    sta_item = net_item.child(si)
+                    if has_issue_flag(sta_item):
+                        sta = sta_item.data(0, Qt.UserRole)[1]
+                        yield file_data[1], ni, si, net, sta
+
+    def _apply_issue_filter(self):
+        """Show only the stations flagged with issues and the network/file
+        rows holding them, or everything when the filter is off.
+
+        The flag is set together with the amber tint, so the filtered tree
+        is exactly the amber part of the full one. Runs on rebuilds and on
+        toggling only: re-filtering after New would hide the clean station
+        the user just created."""
+        on = self._issues_only
+        for fi in range(self.file_tree.topLevelItemCount()):
+            file_item = self.file_tree.topLevelItem(fi)
+            file_shown = False
+            for ni in range(file_item.childCount()):
+                net_item = file_item.child(ni)
+                net_shown = False
+                for si in range(net_item.childCount()):
+                    sta_item = net_item.child(si)
+                    shown = not on or has_issue_flag(sta_item)
+                    sta_item.setHidden(not shown)
+                    net_shown = net_shown or shown
+                net_item.setHidden(on and not net_shown)
+                if on and net_shown:
+                    net_item.setExpanded(True)
+                file_shown = file_shown or net_shown
+            file_item.setHidden(on and not file_shown)
+            if on and file_shown:
+                file_item.setExpanded(True)
+        _clear_hidden_current(self.file_tree)
+
+    def set_issues_only(self, on):
+        """Show only stations with metadata issues in the tree, map and
+        timeline, or all of them.
+
+        Driven by the window-wide View menu toggle. With no on-screen
+        checkbox, the tree header says when the filter is on."""
+        on = bool(on)
+        if on == self._issues_only:
+            return
+        self._issues_only = on
+        self.file_tree.headerItem().setText(
+            0, "Loaded Inventories (issues only)" if on
+            else "Loaded Inventories"
+        )
+        self._apply_issue_filter()
+        self._push_markers()
+        self.update_timeline()
 
     def _add_instrument_detection(self, chan_item, channel):
         if not channel.response:
@@ -325,7 +413,8 @@ class ManagerTab(QWidget):
         return True
 
     def _tint_warning(self, item):
-        tint_warning(item)
+        # Also flags the row, which the issues-only filter reads.
+        flag_issue(item)
 
     def new_explorer_view(self):
         item = self.file_tree.currentItem()
@@ -438,6 +527,38 @@ class ManagerTab(QWidget):
                 self.main_window.open_explorer_tab(
                     filepath=filepath, inventory=inventory
                 )
+            return
+        self._reveal_in_explorer(item)
+
+    def _reveal_in_explorer(self, item):
+        """Open the Explorer of the file holding ``item`` with its station
+        or channel selected. Rows under a channel (⚠ issues, detected
+        instruments) resolve to that channel; a network row keeps its
+        default double-click, expand/collapse."""
+        ref = None
+        node = item
+        while node is not None:
+            data = node.data(0, Qt.UserRole)
+            if data and data[0] in ("station", "channel"):
+                ref = (data[0], data[1])
+                break
+            if data and data[0] in ("network", "file"):
+                return
+            node = node.parent()
+        while node is not None:
+            data = node.data(0, Qt.UserRole)
+            if data and data[0] == "file":
+                break
+            node = node.parent()
+        if ref is None or node is None:
+            return
+        filepath = node.data(0, Qt.UserRole)[1]
+        inventory = self.main_window.loaded_files.get(filepath)
+        if inventory is None:
+            return
+        explorer = self.main_window.open_explorer_tab(filepath, inventory)
+        if explorer is not None:
+            explorer.reveal(ref)
 
     def copy_selected_item(self):
         item = self.file_tree.currentItem()
@@ -723,7 +844,7 @@ class ManagerTab(QWidget):
         data = file_item.data(0, Qt.UserRole) if file_item else None
         if not data or data[0] != "file":
             return None
-        return "{}|{}|{}".format(
+        return _marker_key(
             data[1],
             file_item.indexOfChild(net_item),
             net_item.indexOfChild(sta_item),
@@ -759,6 +880,13 @@ class ManagerTab(QWidget):
                 )
 
     def update_timeline(self):
+        # Set before every rebuild — loads, refresh, edits, theme and font
+        # changes all come through here — so the filter survives them.
+        # Same group key as TimelineWidget.group_stations.
+        self.timeline_widget.issue_groups = {
+            (f"{net.code}.{sta.code}", fp)
+            for fp, _ni, _si, net, sta in self._flagged_stations()
+        } if self._issues_only else None
         self.timeline_widget.update_timeline(
             self.main_window.loaded_files
         )
@@ -793,6 +921,7 @@ class ManagerTab(QWidget):
             # would rebuild them len(loaded_files) times per refresh.
             self.add_file_to_tree(filepath, inventory,
                                   defer_side_views=True)
+        self._apply_issue_filter()
         self._push_markers()
         self.update_timeline()
 

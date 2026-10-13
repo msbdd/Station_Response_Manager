@@ -18,6 +18,10 @@ ERROR_COLOR = "#b93a3a"
 
 _SEVERITY_MARK = {"error": "✖", "warning": "⚠"}
 
+# Marks a channel/station/network/file row as holding issues; the "issues
+# only" filters read it. UserRole + 1 is the trees' _BASELINE_ROLE.
+ISSUE_ROLE = Qt.UserRole + 2
+
 
 def issue_color(severity):
     return ERROR_COLOR if severity == "error" else WARNING_COLOR
@@ -25,6 +29,17 @@ def issue_color(severity):
 
 def tint_warning(item, color=WARNING_COLOR, column=0):
     item.setForeground(column, QBrush(QColor(color)))
+
+
+def flag_issue(item, color=WARNING_COLOR):
+    """Tint ``item`` and mark it as holding issues. Setting both together
+    is what keeps the issues-only filters showing exactly the amber rows."""
+    tint_warning(item, color)
+    item.setData(0, ISSUE_ROLE, True)
+
+
+def has_issue_flag(item):
+    return bool(item.data(0, ISSUE_ROLE))
 
 
 def build_issue_items(channel, two_columns=False):
