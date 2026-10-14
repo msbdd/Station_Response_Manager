@@ -9,7 +9,7 @@ from PyQt5.QtWidgets import (
     QTabBar,
     QLabel,
 )
-from PyQt5.QtCore import QSettings, Qt
+from PyQt5.QtCore import Qt
 from PyQt5.QtGui import QKeySequence
 from SRM_core.utils import (
     resource_path,
@@ -40,6 +40,7 @@ from SRM_gui.dialogs import StationInventoryWizard, ImportFromMiniSEEDDialog
 from SRM_gui.mseed_batch_dialog import BatchInventoryDialog
 from SRM_gui.review_dialog import ReviewChangesDialog
 from SRM_gui.validation_ui import WARNING_COLOR
+from SRM_gui import view_settings
 
 
 def save_targets(items, loaded_paths, exists=os.path.exists):
@@ -201,11 +202,6 @@ class MainWindow(QMainWindow):
         convert_to_xml.triggered.connect(self.convert_to_xml)
         tools_menu.addAction(convert_to_xml)
         view_menu = menubar.addMenu("View")
-        toggle_theme = QAction("Toggle Theme", self)
-        toggle_theme.setShortcut("Ctrl+T")
-        toggle_theme.triggered.connect(self.toggle_theme)
-        view_menu.addAction(toggle_theme)
-        view_menu.addSeparator()
         # Window-wide: filters the Manager's tree, map and timeline and
         # every Explorer, including ones opened while it is on.
         self.issues_only_action = QAction(
@@ -216,6 +212,11 @@ class MainWindow(QMainWindow):
         self.issues_only_action.toggled.connect(self._on_issues_only_toggled)
         view_menu.addAction(self.issues_only_action)
         view_menu.addSeparator()
+        # Appearance: theme and font size, remembered between sessions.
+        toggle_theme = QAction("Toggle Theme", self)
+        toggle_theme.setShortcut("Ctrl+T")
+        toggle_theme.triggered.connect(self.toggle_theme)
+        view_menu.addAction(toggle_theme)
         font_increase = QAction("Increase Font Size", self)
         font_increase.setShortcut("Ctrl+=")
         font_increase.triggered.connect(lambda: self._change_font_size(1))
@@ -281,18 +282,17 @@ class MainWindow(QMainWindow):
             method()
 
     def _change_font_size(self, delta):
-        app = QApplication.instance()
-        font = app.font()
         if delta == 0:
-            if not hasattr(self, '_default_font_size'):
-                self._default_font_size = font.pointSize()
-            font.setPointSize(self._default_font_size)
+            # Back to the system size, and forget the saved one so a later
+            # change of the desktop's font is followed again.
+            view_settings.set_font_size(view_settings.system_font_size())
+            view_settings.save_font_size(None)
         else:
-            if not hasattr(self, '_default_font_size'):
-                self._default_font_size = font.pointSize()
-            new_size = max(6, font.pointSize() + delta)
-            font.setPointSize(new_size)
-        app.setFont(font)
+            size = min(max(QApplication.font().pointSize() + delta,
+                           view_settings.MIN_FONT_PT),
+                       view_settings.MAX_FONT_PT)
+            view_settings.set_font_size(size)
+            view_settings.save_font_size(size)
         if hasattr(self, 'manager_tab'):
             self.manager_tab.update_timeline()
 
@@ -917,16 +917,10 @@ class MainWindow(QMainWindow):
         msg_box.exec_()
 
     def toggle_theme(self):
-        from app import make_dark_palette
         from SRM_core.utils import is_dark_theme
-        app = QApplication.instance()
-        settings = QSettings("SRM", "StationResponseManager")
-        if is_dark_theme():
-            app.setPalette(app.style().standardPalette())
-            settings.setValue("theme", "light")
-        else:
-            app.setPalette(make_dark_palette())
-            settings.setValue("theme", "dark")
+        theme = "light" if is_dark_theme() else "dark"
+        view_settings.apply_theme(theme)
+        view_settings.save_theme(theme)
         if hasattr(self, 'manager_tab'):
             self.manager_tab.refresh_theme()
         for key, widget in self.open_tabs.items():
