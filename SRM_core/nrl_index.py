@@ -32,6 +32,47 @@ class InstrumentInfo:
     family_name: Optional[str] = None
     variant_params: Optional[str] = None
 
+    @property
+    def nrl_model(self) -> str:
+        """The model as the NRL names it in the leaf description
+        ("40 Hz: Quanterra; Q330HR; Preamp_Gain 1; ..." -> "Q330HR"), or
+        the file name stem when the description has no such form."""
+        desc = self.description.split(":", 1)[-1]
+        parts = [p.strip() for p in desc.split(";")]
+        if len(parts) > 1 and parts[1]:
+            return parts[1]
+        return self.model
+
+
+def distinct_models(infos) -> List[Tuple[str, str]]:
+    """``(manufacturer, model)`` of ``infos``, once each, in order."""
+    seen = []
+    for info in infos or ():
+        key = (info.manufacturer, info.nrl_model)
+        if key not in seen:
+            seen.append(key)
+    return seen
+
+
+def _single_model_confidence(candidates) -> float:
+    # A response can only narrow an instrument down to the models that
+    # share it: certain when that is one model, never by tie-breaking.
+    return 1.0 if len(distinct_models(candidates)) == 1 else 0.0
+
+
+def _datalogger_total_gain(info: InstrumentInfo) -> Optional[float]:
+    """An NRL datalogger's overall gain from its indexed stage gains.
+
+    ``stage0_gain`` is the file's first stage: a V->V preamp in most NRL
+    files, but the ADC itself in those without one (4739 of 25638), where
+    it equals the gain from the ADC on and must not be counted twice."""
+    adc, first = info.adc_gain, info.stage0_gain
+    if not adc:
+        return None
+    if not first or abs(first - adc) <= 1e-6 * abs(adc):
+        return abs(adc)
+    return abs(first * adc)
+
 
 def extract_family_info(manufacturer: str, model: str, description: str
                         ) -> Tuple[str, str]:
@@ -112,10 +153,19 @@ def extract_family_info(manufacturer: str, model: str, description: str
 class DetectionResult:
     sensor: Optional[InstrumentInfo] = None
     datalogger: Optional[InstrumentInfo] = None
+    # Every NRL entry the response cannot be told apart from: for a sensor
+    # the same first stage, for a datalogger the same digital (FIR) chain.
+    # Different models sharing one is expected — Centaur, Meridian, Taurus
+    # and Titan run the same Nanometrics chain.
     sensor_candidates: Optional[List['InstrumentInfo']] = None
     datalogger_candidates: Optional[List['InstrumentInfo']] = None
+    # 1.0 when the candidates are all one model, else 0.0.
     sensor_confidence: float = 0.0
     datalogger_confidence: float = 0.0
+    # The datalogger candidates whose gain configuration matches too. It
+    # orders the candidates but never picks a model: the same chain is
+    # configured to the same gain on different models.
+    datalogger_gain_matches: Optional[List['InstrumentInfo']] = None
 
     @property
     def found_any(self) -> bool:
@@ -123,25 +173,11 @@ class DetectionResult:
 
     @property
     def sensor_ambiguous(self) -> bool:
-        return (self.sensor_candidates is not None and
-                len(self.sensor_candidates) > 1)
+        return len(distinct_models(self.sensor_candidates)) > 1
 
     @property
     def datalogger_ambiguous(self) -> bool:
-        return (self.datalogger_candidates is not None and
-                len(self.datalogger_candidates) > 1)
-
-    @property
-    def sensor_family(self) -> Optional[str]:
-        if self.sensor and self.sensor.family_name:
-            return self.sensor.family_name
-        return None
-
-    @property
-    def datalogger_family(self) -> Optional[str]:
-        if self.datalogger and self.datalogger.family_name:
-            return self.datalogger.family_name
-        return None
+        return len(distinct_models(self.datalogger_candidates)) > 1
 
 
 class NRLIndex:
@@ -770,49 +806,61 @@ class NRLIndex:
         if sensor_sig and sensor_sig in self._sensor_signatures:
             candidates = self._sensor_signatures[sensor_sig]
             result.sensor_candidates = candidates
-
-            if len(candidates) == 1:
-                result.sensor = candidates[0]
-                result.sensor_confidence = 1.0
-            else:
-                result.sensor = candidates[0]
-                result.sensor_confidence = 0.0
+            result.sensor = candidates[0]
+            result.sensor_confidence = _single_model_confidence(candidates)
 
         adc_idx = self._find_adc_stage_index(response)
-        if adc_idx is not None:
-            exact_sig = self._compute_dl_sig_with_preamp(response, adc_idx)
-            if exact_sig and exact_sig in self._datalogger_signatures:
-                candidates = self._datalogger_signatures[exact_sig]
-                result.datalogger_candidates = candidates
+        if adc_idx is None or not self._has_digital_filters(response, adc_idx):
+            # Without a FIR stage nothing identifies the digitizer: its gain
+            # alone fits dozens of NRL models (419430 counts/V is a Centaur,
+            # a Taurus and a STANEO D24-48 alike). Every such response used
+            # to hash to one empty chain shared by 95 entries from 8 makers.
+            return result
 
-                if len(candidates) == 1:
-                    result.datalogger = candidates[0]
-                    result.datalogger_confidence = 1.0
-                else:
-                    result.datalogger = candidates[0]
-                    result.datalogger_confidence = 0.0
-                return result
-
-        family_sig = self._compute_datalogger_signature_from_response(response)
-        if family_sig and family_sig in self._datalogger_family_sigs:
-            candidates = self._datalogger_family_sigs[family_sig]
-            result.datalogger_candidates = candidates
-
-            if len(candidates) == 1:
-                result.datalogger = candidates[0]
-                result.datalogger_confidence = 1.0
-            elif len(candidates) > 1:
-                best_match = self._disambiguate_by_gain_calculation(
-                    response, candidates, result.sensor, adc_idx
-                )
-                if best_match:
-                    result.datalogger = best_match[0]
-                    result.datalogger_confidence = best_match[1]
-                else:
-                    result.datalogger = candidates[0]
-                    result.datalogger_confidence = 0.0
-
+        family_sig = self._compute_dl_sig_without_gain(response, adc_idx)
+        candidates = self._datalogger_family_sigs.get(family_sig)
+        if not candidates:
+            return result
+        exact_sig = self._compute_dl_sig_with_preamp(response, adc_idx)
+        gain_matches = (self._datalogger_signatures.get(exact_sig)
+                        or self._gain_matches(response, adc_idx, candidates))
+        matched = {c.nrl_path for c in gain_matches}
+        result.datalogger_candidates = (
+            list(gain_matches)
+            + [c for c in candidates if c.nrl_path not in matched]
+        )
+        result.datalogger_gain_matches = list(gain_matches) or None
+        result.datalogger = result.datalogger_candidates[0]
+        result.datalogger_confidence = _single_model_confidence(candidates)
         return result
+
+    def _has_digital_filters(self, response: Response, adc_idx: int) -> bool:
+        """Whether anything from the ADC on carries FIR coefficients — the
+        part of a response that fingerprints a digitizer."""
+        return any(not self._is_passthrough_stage(stage)
+                   for stage in response.response_stages[adc_idx:])
+
+    # Exact signatures compare gains to two decimals, so a data centre's
+    # 419430.4 against the NRL's 419430 matches no configuration exactly.
+    _GAIN_TOLERANCE = 0.01
+
+    def _gain_matches(
+        self, response: Response, adc_idx: int,
+        candidates: List[InstrumentInfo],
+    ) -> List[InstrumentInfo]:
+        """The candidates whose overall gain (preamp, ADC and digital
+        stages) matches the response's within ``_GAIN_TOLERANCE``."""
+        preamp = self._datalogger_preamp_gain(response, adc_idx) or 1.0
+        total = abs(preamp * self._compute_total_digital_gain(
+            response, adc_idx))
+        if not total:
+            return []
+        matches = []
+        for candidate in candidates:
+            expected = _datalogger_total_gain(candidate)
+            if expected and abs(total / expected - 1) <= self._GAIN_TOLERANCE:
+                matches.append(candidate)
+        return matches
 
     def _find_adc_stage_index(self, response: Response) -> Optional[int]:
         # The ADC is the analog-to-digital boundary: the first stage whose
@@ -831,19 +879,6 @@ class NRLIndex:
             out_str = str(out_units).upper() if out_units else ""
             if 'COUNT' in out_str:
                 return i
-
-        return None
-
-    def _compute_datalogger_signature_from_response(
-        self, response: Response
-    ) -> Optional[str]:
-        if not response or not response.response_stages:
-            return None
-
-        adc_idx = self._find_adc_stage_index(response)
-
-        if adc_idx is not None:
-            return self._compute_dl_sig_without_gain(response, adc_idx)
 
         return None
 
@@ -912,106 +947,6 @@ class NRLIndex:
                 fir_idx += 1
 
         return hasher.hexdigest()
-
-    def _disambiguate_by_gain_calculation(
-        self,
-        response: Response,
-        candidates: List[InstrumentInfo],
-        sensor: Optional[InstrumentInfo] = None,
-        adc_idx: Optional[int] = None
-    ) -> Optional[Tuple[InstrumentInfo, float]]:
-
-        if adc_idx is None:
-            adc_idx = self._find_adc_stage_index(response)
-        if adc_idx is None:
-            return None
-
-        user_adc_gain = self._compute_total_digital_gain(response, adc_idx)
-
-        if user_adc_gain is None or user_adc_gain == 0:
-            return None
-
-        user_preamp_gain = 1.0
-        for i in range(1, adc_idx):
-            stage = response.response_stages[i]
-            if hasattr(stage, 'stage_gain') and stage.stage_gain:
-                user_preamp_gain *= abs(float(stage.stage_gain))
-
-        if user_preamp_gain == 0:
-            return None
-
-        tolerance = 0.15
-        matches = []
-
-        for candidate in candidates:
-            if candidate.adc_gain and candidate.stage0_gain:
-                candidate_adc = abs(candidate.adc_gain)
-                candidate_preamp = abs(candidate.stage0_gain)
-
-                if candidate_adc > 0 and candidate_preamp > 0:
-                    adc_ratio = user_adc_gain / candidate_adc
-                    preamp_ratio = candidate_preamp / user_preamp_gain
-
-                    if preamp_ratio > 0:
-                        rel_diff = abs(adc_ratio - preamp_ratio) / preamp_ratio
-                        if rel_diff < tolerance:
-                            conf = max(0.5, 1.0 - rel_diff * 2)
-                            matches.append((candidate, conf))
-
-        if matches:
-            matches.sort(key=lambda x: x[1], reverse=True)
-            return matches[0]
-
-        for candidate in candidates:
-            if candidate.adc_gain:
-                candidate_adc = abs(candidate.adc_gain)
-                if candidate_adc > 0:
-                    ratio = user_adc_gain / candidate_adc
-                    for expected in [1.0, 2.0, 4.0, 0.5, 0.25]:
-                        rel_diff = abs(ratio - expected) / expected
-                        if rel_diff < 0.1:
-                            conf = 0.7 - rel_diff
-                            matches.append((candidate, conf))
-                            break
-
-        if matches:
-            matches.sort(key=lambda x: x[1], reverse=True)
-            return matches[0]
-
-        return None
-
-    def format_detection_result(
-        self, result: DetectionResult, multiline: bool = False,
-        show_family: bool = True
-    ) -> str:
-        parts = []
-
-        if result.sensor:
-            if show_family and result.sensor_ambiguous:
-                n_similar = len(result.sensor_candidates) - 1
-                family = result.sensor.family_name or result.sensor.model
-                parts.append(f"Sensor: {family} (+{n_similar} similar)")
-            else:
-                mfr = result.sensor.manufacturer
-                model = result.sensor.model
-                parts.append(f"Sensor: {mfr} {model}")
-
-        if result.datalogger:
-            if show_family and result.datalogger_ambiguous:
-                n_similar = len(result.datalogger_candidates) - 1
-                family = (result.datalogger.family_name or
-                          result.datalogger.model)
-                parts.append(f"Datalogger: {family} (+{n_similar} similar)")
-            else:
-                mfr = result.datalogger.manufacturer
-                model = result.datalogger.model
-                parts.append(f"Datalogger: {mfr} {model}")
-
-        if not parts:
-            return ""
-
-        separator = "\n" if multiline else " | "
-        return separator.join(parts)
 
     def get_stats(self) -> Dict[str, int]:
         """Get index statistics."""

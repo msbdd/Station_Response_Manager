@@ -123,6 +123,9 @@ class StationInventoryWizard(QDialog):
             "resp_btn": QPushButton("Select Response..."),
             "response_obj": None,
             "response_info": "Not Selected",
+            # (sensor, datalogger) picked in the NRL, recorded as the
+            # channels' <Sensor>/<DataLogger>.
+            "equipment": (None, None),
         }
         full_codes_cb.toggled.connect(
             lambda checked: self._set_full_codes_mode(widgets, checked)
@@ -185,6 +188,7 @@ class StationInventoryWizard(QDialog):
             response_obj, s_info, d_info = dialog.get_response()
             group_widgets = self.groups[group_num]
             group_widgets["response_obj"] = response_obj
+            group_widgets["equipment"] = dialog.get_equipment()
             group_widgets["response_info"] = (
                 f"Sensor: {s_info} | Datalogger: {d_info}"
             )
@@ -428,6 +432,7 @@ class StationInventoryWizard(QDialog):
         rate = float(widgets["rate"].text())
         start_date = UTCDateTime(widgets["date"].dateTime().toPyDateTime())
         response = widgets["response_obj"]
+        sensor, logger = widgets["equipment"]
 
         for loc, code in zip(locs, codes):
             az, dip = orientation_for(code)
@@ -447,6 +452,10 @@ class StationInventoryWizard(QDialog):
                     sample_rate=rate,
                     start_date=start_date,
                     response=deepcopy(response),
+                    # Copies: one shared object would make an edit of one
+                    # channel's instrument change them all.
+                    sensor=deepcopy(sensor),
+                    data_logger=deepcopy(logger),
                 )
             )
         return channels

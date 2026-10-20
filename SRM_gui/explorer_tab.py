@@ -15,6 +15,8 @@ from PyQt5.QtCore import Qt
 from obspy import UTCDateTime
 from obspy.core.inventory import Station, Channel
 from obspy.core.inventory.response import Response
+from obspy.core.inventory.util import Equipment
+from SRM_core.instrumentation import stated_name
 from SRM_gui.validation_ui import (
     build_issue_items, flag_issue, has_issue_flag,
 )
@@ -304,8 +306,11 @@ class ExplorerTab(QWidget):
     # miss them — and several have validating ObsPy setters that raise on
     # a raw string (an unhandled exception in a Qt slot aborts the whole
     # process under PyQt5).
+    # ObsPy's Equipment has no setters for its dates, so without parsing
+    # here an edit of those would store the raw text.
     _DATE_FIELDS = {
         "start_date", "end_date", "creation_date", "termination_date",
+        "installation_date", "removal_date",
     }
     _FLOAT_FIELDS = {"water_level", "clock_drift_in_seconds_per_sample"}
     _INT_FIELDS = {"total_number_of_stations"}
@@ -318,10 +323,60 @@ class ExplorerTab(QWidget):
     # a URI. Seeded with a valid, obviously-placeholder local identifier.
     _URI_FIELDS = ("source_id",)
     _URI_PLACEHOLDER = "smi:local/unset"
+    # A channel's stated instruments, shown as sub-nodes named after their
+    # StationXML elements: (Channel attribute, label).
+    _EQUIPMENT_NODES = (
+        ("sensor", "Sensor"),
+        ("data_logger", "DataLogger"),
+        ("pre_amplifier", "PreAmplifier"),
+    )
+    _EQUIPMENT_FIELDS = [
+        "description", "installation_date", "manufacturer", "model",
+        "removal_date", "resource_id", "serial_number", "type", "vendor",
+    ]
+
+    @staticmethod
+    def _equipment_ref(item):
+        """``(channel, attr)`` for an instrument node, else None. Field rows
+        hold ``(obj, field)``, so only the str tag marks a node."""
+        ref = item.data(0, Qt.UserRole) if item is not None else None
+        if (isinstance(ref, tuple) and len(ref) == 3
+                and isinstance(ref[0], str) and ref[0] == "equipment"):
+            return ref[1], ref[2]
+        return None
+
+    def _add_equipment_nodes(self, chan_item, chan):
+        for attr, label in self._EQUIPMENT_NODES:
+            equipment = getattr(chan, attr, None)
+            if equipment is None:
+                continue
+            node = QTreeWidgetItem(
+                chan_item, [label, stated_name(equipment) or ""]
+            )
+            node.setData(0, Qt.UserRole, ("equipment", chan, attr))
+            self.add_object_fields(node, equipment)
+
+    def _refresh_equipment_summary(self, node):
+        """An instrument node shows the name its element states; re-read
+        it after one of the element's fields changed."""
+        equipment_ref = self._equipment_ref(node)
+        if equipment_ref is None:
+            return
+        chan, attr = equipment_ref
+        # The node has no (obj, field) ref: an itemChanged reaching
+        # handle_tree_edit for it must be suppressed.
+        was = self._suppress_edits
+        self._suppress_edits = True
+        try:
+            node.setText(1, stated_name(getattr(chan, attr, None)) or "")
+        finally:
+            self._suppress_edits = was
 
     def _find_header_item(self, item):
-        # Walk up to the nearest Network/Station/Channel header
+        # Walk up to the nearest Network/Station/Channel/instrument header
         while item:
+            if self._equipment_ref(item) is not None:
+                return item
             label = item.text(0)
             for prefix in ("Network: ", "Station: ", "Channel: "):
                 if label.startswith(prefix):
@@ -331,6 +386,10 @@ class ExplorerTab(QWidget):
 
     def _get_obj_for_header(self, header_item):
         # Get the ObsPy object for a Network/Station/Channel header
+        equipment_ref = self._equipment_ref(header_item)
+        if equipment_ref is not None:
+            chan, attr = equipment_ref
+            return getattr(chan, attr, None)
         label = header_item.text(0)
         inv = self.current_inventory
         if label.startswith("Network: "):
@@ -420,7 +479,15 @@ class ExplorerTab(QWidget):
             QMessageBox.warning(self, "Error", "Could not resolve object.")
             return
 
-        if label.startswith("Network: "):
+        # "New <Sensor>"-style choices: an instrument element the channel
+        # does not state yet, mapped to its Channel attribute.
+        new_equipment = {}
+        if self._equipment_ref(header) is not None:
+            field_choices = self._missing_fields(
+                obj, self._EQUIPMENT_FIELDS
+            )
+            new_item_label = None
+        elif label.startswith("Network: "):
             field_choices = self._missing_fields(obj, self._NETWORK_FIELDS)
             new_item_label = "New Station"
         elif label.startswith("Station: "):
@@ -429,12 +496,18 @@ class ExplorerTab(QWidget):
         elif label.startswith("Channel: "):
             field_choices = self._missing_fields(obj, self._CHANNEL_FIELDS)
             new_item_label = None
+            new_equipment = {
+                f"New {node_label}": attr
+                for attr, node_label in self._EQUIPMENT_NODES
+                if getattr(obj, attr, None) is None
+            }
         else:
             return
 
         choices = []
         if new_item_label:
             choices.append(new_item_label)
+        choices.extend(new_equipment)
         choices.extend(field_choices)
 
         if not choices:
@@ -468,6 +541,13 @@ class ExplorerTab(QWidget):
             obj.channels.append(chan)
             self._push_undo(("add_channel", obj, chan))
             new_ref = ("channel", chan)
+        elif choice in new_equipment:
+            # An empty element (<Sensor/> is valid StationXML); its fields
+            # are added with New on the instrument node.
+            attr = new_equipment[choice]
+            setattr(obj, attr, Equipment())
+            self._push_undo(("add_field", obj, attr, None))
+            new_ref = ("equipment", obj, attr)
         else:
             prev_value = getattr(obj, choice, None)
             try:
@@ -678,6 +758,7 @@ class ExplorerTab(QWidget):
                         )
                         sta_item.addChild(chan_item)
                         self.add_object_fields(chan_item, chan)
+                        self._add_equipment_nodes(chan_item, chan)
                         resp = chan.response
                         if resp:
                             resp_item = QTreeWidgetItem(["Response", ""])
@@ -805,6 +886,7 @@ class ExplorerTab(QWidget):
             can_delete = (
                 label.startswith("Station: ")
                 or label.startswith("Channel: ")
+                or self._equipment_ref(item) is not None
                 or self._is_optional_field(item)
             )
             self.delete_button.setEnabled(can_delete)
@@ -887,6 +969,23 @@ class ExplorerTab(QWidget):
             self.populate_tree(self.current_inventory)
             return
 
+        # Delete a stated instrument: the whole element
+        equipment_ref = self._equipment_ref(item)
+        if equipment_ref is not None:
+            chan, attr = equipment_ref
+            reply = QMessageBox.question(
+                self, "Delete Instrument",
+                f"Remove the channel's <{label}> and all its fields?",
+                QMessageBox.Yes | QMessageBox.No, QMessageBox.No,
+            )
+            if reply != QMessageBox.Yes:
+                return
+            old_value = getattr(chan, attr, None)
+            setattr(chan, attr, None)
+            self._push_undo(("delete_field", chan, attr, old_value))
+            self.populate_tree(self.current_inventory)
+            return
+
         # Delete an optional property field
         if self._is_optional_field(item):
             obj, field = item.data(0, Qt.UserRole)
@@ -907,7 +1006,7 @@ class ExplorerTab(QWidget):
             return
 
         ref = item.data(0, Qt.UserRole)
-        if ref is None:
+        if not (isinstance(ref, tuple) and len(ref) == 2):
             return
 
         ref_object, attr = ref
@@ -963,6 +1062,7 @@ class ExplorerTab(QWidget):
                 )
             finally:
                 self._suppress_edits = False
+            self._refresh_equipment_summary(item.parent())
 
         except Exception as e:
             QMessageBox.warning(
@@ -1001,15 +1101,18 @@ class ExplorerTab(QWidget):
             # differ by location (e.g. 00.BHZ / 10.BHZ) get distinct ids.
             chan_ref = chan_item.data(0, Qt.UserRole)
             loc_code = ""
+            channel = None
             if (chan_ref and isinstance(chan_ref, tuple)
                     and chan_ref[0] == "channel"):
-                loc_code = chan_ref[1].location_code or ""
+                channel = chan_ref[1]
+                loc_code = channel.location_code or ""
             unique_id = f"{net_code}.{sta_code}.{loc_code}.{chan_code}"
 
             self.main_window.open_response_tab(
                 response_id=unique_id,
                 response_data=response,
                 explorer_tab=self,
+                channel=channel,
             )
 
     def set_issues_only(self, on):
@@ -1252,6 +1355,7 @@ class ExplorerTab(QWidget):
             self._apply_modified_style(
                 item, self._values_differ(value, baseline_value)
             )
+            self._refresh_equipment_summary(item.parent())
             if attr == "code":
                 # filter_tree and navigate_to match on the header text,
                 # so a rename must update it or filtering/navigation

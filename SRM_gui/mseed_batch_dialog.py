@@ -117,6 +117,9 @@ class BatchInventoryDialog(QDialog):
         self._group_keys = list(self._groups)
         self._responses = dict.fromkeys(self._group_keys)
         self._response_info = {}
+        # (sensor, datalogger) picked in the NRL per group, recorded as the
+        # channels' <Sensor>/<DataLogger>.
+        self._equipment = dict.fromkeys(self._group_keys, (None, None))
         self._coord_boxes = {}
 
         layout = QVBoxLayout(self)
@@ -316,7 +319,7 @@ class BatchInventoryDialog(QDialog):
         if response is None:
             return None
         info = f"Sensor: {sensor_info} | Datalogger: {datalogger_info}"
-        return response, info
+        return response, info, dialog.get_equipment()
 
     def _select_response(self, key):
         picked = self._pick_response()
@@ -335,9 +338,11 @@ class BatchInventoryDialog(QDialog):
     def _clear_response(self, key):
         self._set_group_response(key, None, None)
 
-    def _set_group_response(self, key, response, info):
+    def _set_group_response(self, key, response, info,
+                            equipment=(None, None)):
         self._responses[key] = response
         self._response_info[key] = info
+        self._equipment[key] = equipment
         self._refresh_group_row(self._group_keys.index(key))
 
     def _mismatches(self):
@@ -397,6 +402,7 @@ class BatchInventoryDialog(QDialog):
                 self.stations,
                 responses=self._responses,
                 coords=coords,
+                equipment=self._equipment,
                 open_ended=not self.close_epochs_cb.isChecked(),
             )
             if not self._confirm_build(notes, coords):

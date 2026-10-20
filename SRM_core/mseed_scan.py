@@ -174,10 +174,12 @@ def rate_mismatch(response, sample_rate):
 
 
 def build_inventory(stations, responses=None, coords=None, open_ended=True,
-                    source="Station Response Manager"):
-
+                    source="Station Response Manager", equipment=None):
+    # ``equipment`` maps a group key to the (sensor, datalogger) Equipment
+    # picked in the NRL for it; either may be None (nothing to state).
     responses = responses or {}
     coords = coords or {}
+    equipment = equipment or {}
     notes = {"no_azimuth": [], "overlaps": []}
     networks = {}
     for scanned in stations:
@@ -203,6 +205,9 @@ def build_inventory(stations, responses=None, coords=None, open_ended=True,
             for i, epoch in enumerate(epochs):
                 is_latest = i == len(epochs) - 1
                 response = responses.get(group_key(epoch))
+                sensor, logger = equipment.get(
+                    group_key(epoch), (None, None)
+                )
                 channels.append(Channel(
                     code=cha,
                     location_code=loc,
@@ -218,6 +223,10 @@ def build_inventory(stations, responses=None, coords=None, open_ended=True,
                               else epoch.end),
                     response=(deepcopy(response) if response is not None
                               else Response()),
+                    # Copies: one shared object would make an edit of one
+                    # channel's instrument change them all.
+                    sensor=deepcopy(sensor),
+                    data_logger=deepcopy(logger),
                 ))
 
         start = min(e.start for e in scanned.epochs)

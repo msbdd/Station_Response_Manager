@@ -21,6 +21,8 @@ from SRM_core.utils import (
     BASE_COLORS,
     is_dark_theme,
 )
+from SRM_core.instrumentation import is_placeholder_serial, stated_name
+from SRM_gui.instrument_ui import NOT_STATED
 from fnmatch import fnmatch
 from datetime import datetime, timezone as _tz
 import html
@@ -35,6 +37,26 @@ def _match(pattern, full_id, has_wildcards):
         glob_pat = pattern if '*' in pattern else f"*{pattern}*"
         return fnmatch(full_id, glob_pat)
     return pattern in full_id
+
+
+def _serial(equipment):
+    text = str(getattr(equipment, "serial_number", None) or "").strip()
+    return text or None
+
+
+def _instrument_line(equipment):
+    """Tooltip text for a stated instrument — its name and serial number —
+    or None when the channel states neither. Only what the file states:
+    the timeline has no NRL index to detect anything with."""
+    name = stated_name(equipment)
+    serial = _serial(equipment)
+    if not name and not serial:
+        return None
+    text = name or NOT_STATED
+    if serial:
+        mark = ", placeholder" if is_placeholder_serial(serial) else ""
+        text += f" (S/N {serial}{mark})"
+    return text
 
 
 def _fmt_val(v):
@@ -978,6 +1000,13 @@ class TimelineWidget(QWidget):
                             f"\nSensitivity: {sens.value}"
                             f" {sens.input_units}"
                         )
+                    for label, equipment in (
+                        ("Sensor", ch.sensor),
+                        ("Digitizer", ch.data_logger),
+                    ):
+                        line = _instrument_line(equipment)
+                        if line:
+                            tip += f"\n{label}: {line}"
                     cur_fields = [
                         ("Lat", ch.latitude, ""),
                         ("Lon", ch.longitude, ""),
@@ -991,6 +1020,11 @@ class TimelineWidget(QWidget):
                             if sens else None,
                             "",
                         ),
+                        # A swap shows up as a change of either.
+                        ("Sensor", stated_name(ch.sensor), ""),
+                        ("Sensor S/N", _serial(ch.sensor), ""),
+                        ("Digitizer", stated_name(ch.data_logger), ""),
+                        ("Digitizer S/N", _serial(ch.data_logger), ""),
                     ]
                     tip = _with_diff(tip, prev_fields, cur_fields)
                     prev_fields = cur_fields

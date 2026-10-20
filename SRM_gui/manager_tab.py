@@ -11,10 +11,10 @@ from PyQt5.QtWidgets import (
     QFileDialog,
 )
 from copy import deepcopy
+from SRM_core import fleet
 from SRM_core.utils import atomic_write_inventory, make_export_inventory
 from PyQt5.QtWebEngineWidgets import QWebEngineView
 from PyQt5.QtWebChannel import QWebChannel
-from PyQt5.QtGui import QColor, QBrush
 from PyQt5.QtCore import (
     Qt, QTimer, QUrl, QObject, pyqtSignal, pyqtSlot,
 )
@@ -22,6 +22,8 @@ from SRM_gui.explorer_tab import (
     _clear_hidden_current, _identity_index, notify_inventory_changed,
 )
 from SRM_gui.timeline import TimelineWidget
+from SRM_gui.instrument_ui import instrument_rows
+from SRM_gui.instruments_view import InstrumentsWidget
 from SRM_gui.validation_ui import (
     build_issue_items, flag_issue, has_issue_flag,
 )
@@ -61,6 +63,14 @@ class ManagerTab(QWidget):
         self._stale = False
         # Window-wide View > Show Only Stations with Metadata Issues.
         self._issues_only = False
+        # The Instruments tab's selection, applied to the tree, map and
+        # timeline too: role -> category keys, over current deployments
+        # or all epochs. The station sets are recomputed on every rebuild.
+        self._instrument_selection = {}
+        self._instrument_current = True
+        self._instrument_label = ""
+        self._instrument_blocks = None
+        self._instrument_groups = None
         splitter = QSplitter(Qt.Horizontal)
         left_widget = QWidget()
         left_layout = QVBoxLayout(left_widget)
@@ -139,6 +149,12 @@ class ManagerTab(QWidget):
             self.open_from_timeline
         )
         self.right_tabs.addTab(self.timeline_widget, "Timeline")
+
+        self.instruments_widget = InstrumentsWidget()
+        self.instruments_widget.filter_changed.connect(
+            self.set_instrument_filter
+        )
+        self.right_tabs.addTab(self.instruments_widget, "Instruments")
         self.right_tabs.currentChanged.connect(
             self.on_right_tab_changed
         )
@@ -194,7 +210,7 @@ class ManagerTab(QWidget):
                     chan_item = QTreeWidgetItem([f"Channel: {chan.code}"])
                     chan_item.setData(0, Qt.UserRole, ("channel", chan))
                     sta_item.addChild(chan_item)
-                    self._add_instrument_detection(chan_item, chan)
+                    self._add_instrumentation(chan_item, chan)
                     if self._add_validation_warnings(chan_item, chan):
                         sta_has_issues = True
 
@@ -215,9 +231,11 @@ class ManagerTab(QWidget):
             self._station_markers_for_file(abs_filepath, inventory)
         )
         if not defer_side_views:
+            self._recompute_instrument_filter()
             self._apply_issue_filter()
             self._push_markers()
             self.update_timeline()
+            self.update_instruments()
 
     def _station_markers_for_file(self, filepath, inventory):
         # net_idx/sta_idx key the marker back to the tree by position —
@@ -251,8 +269,22 @@ class ManagerTab(QWidget):
                 m for m in stations
                 if _marker_key(m["file"], m["net_idx"], m["sta_idx"]) in keys
             ]
+        if self._instrument_blocks is not None:
+            stations = [
+                m for m in stations
+                if id(self._marker_station(m)) in self._instrument_blocks
+            ]
         js_code = f"addStations({json.dumps(stations)});"
         self.map_view.page().runJavaScript(js_code)
+
+    def _marker_station(self, marker):
+        """The <Station> a map marker stands for, by its tree position."""
+        inventory = self.main_window.loaded_files.get(marker["file"])
+        try:
+            net = inventory.networks[marker["net_idx"]]
+            return net.stations[marker["sta_idx"]]
+        except (AttributeError, IndexError):
+            return None
 
     def _flagged_stations(self):
         """Yield ``(filepath, net_idx, sta_idx, network, station)`` for each
@@ -275,13 +307,17 @@ class ManagerTab(QWidget):
 
     def _apply_issue_filter(self):
         """Show only the stations flagged with issues and the network/file
-        rows holding them, or everything when the filter is off.
+        rows holding them, or everything when the filter is off — and of
+        those, only stations with the instruments the Instruments tab
+        selects, when it selects any.
 
         The flag is set together with the amber tint, so the filtered tree
         is exactly the amber part of the full one. Runs on rebuilds and on
         toggling only: re-filtering after New would hide the clean station
         the user just created."""
-        on = self._issues_only
+        issues = self._issues_only
+        blocks = self._instrument_blocks
+        on = issues or blocks is not None
         for fi in range(self.file_tree.topLevelItemCount()):
             file_item = self.file_tree.topLevelItem(fi)
             file_shown = False
@@ -290,7 +326,9 @@ class ManagerTab(QWidget):
                 net_shown = False
                 for si in range(net_item.childCount()):
                     sta_item = net_item.child(si)
-                    shown = not on or has_issue_flag(sta_item)
+                    sta = sta_item.data(0, Qt.UserRole)[1]
+                    shown = ((not issues or has_issue_flag(sta_item))
+                             and (blocks is None or id(sta) in blocks))
                     sta_item.setHidden(not shown)
                     net_shown = net_shown or shown
                 net_item.setHidden(on and not net_shown)
@@ -312,95 +350,57 @@ class ManagerTab(QWidget):
         if on == self._issues_only:
             return
         self._issues_only = on
+        self._update_tree_header()
+        self._apply_issue_filter()
+        self._push_markers()
+        self.update_timeline()
+        self.update_instruments()
+
+    def _update_tree_header(self):
+        filters = []
+        if self._issues_only:
+            filters.append("issues only")
+        if self._instrument_blocks is not None and self._instrument_label:
+            filters.append(self._instrument_label)
         self.file_tree.headerItem().setText(
-            0, "Loaded Inventories (issues only)" if on
-            else "Loaded Inventories"
+            0, "Loaded Inventories"
+            + (f" ({' · '.join(filters)})" if filters else "")
         )
+
+    def set_instrument_filter(self, selection, current_only, label):
+        """Show only stations with the instruments the Instruments tab
+        selects, in the tree, map and timeline alike; an empty selection
+        shows all again. Combines with issues-only."""
+        self._instrument_selection = dict(selection or {})
+        self._instrument_current = bool(current_only)
+        self._instrument_label = label
+        self._recompute_instrument_filter()
+        self._update_tree_header()
         self._apply_issue_filter()
         self._push_markers()
         self.update_timeline()
 
-    def _add_instrument_detection(self, chan_item, channel):
-        if not channel.response:
+    def _recompute_instrument_filter(self):
+        """Re-derive the selected stations from the current inventories:
+        an edit can move a station in or out of the selection."""
+        if not any(self._instrument_selection.values()):
+            self._instrument_blocks = self._instrument_groups = None
             return
+        deps = fleet.selected(
+            fleet.deployments(self.main_window.loaded_files,
+                              self.main_window.nrl_index,
+                              current_only=self._instrument_current),
+            self._instrument_selection)
+        self._instrument_blocks = fleet.station_blocks(deps)
+        self._instrument_groups = fleet.timeline_groups(deps)
 
-        nrl_index = self.main_window.nrl_index
-        result = nrl_index.detect_instrument(channel.response)
-
-        if result.sensor:
-            if result.sensor_ambiguous:
-                n_candidates = len(result.sensor_candidates)
-                mfr = result.sensor.manufacturer
-                model = result.sensor.model
-                family = result.sensor.family_name or f"{mfr} {model}"
-                sensor_text = f"sensor: {family} (+{n_candidates - 1} similar)"
-            else:
-                sensor_text = (
-                    f"sensor: {result.sensor.manufacturer} "
-                    f"{result.sensor.model}"
-                )
-            sensor_item = QTreeWidgetItem([sensor_text])
-            sensor_item.setData(
-                0, Qt.UserRole, ("sensor_info", result)
-            )
-            sensor_item.setForeground(0, QBrush(QColor("#2e7d32")))
-            font = sensor_item.font(0)
-            font.setItalic(True)
-            sensor_item.setFont(0, font)
-            sensor_item.setFlags(
-                sensor_item.flags() & ~Qt.ItemIsSelectable
-            )
-            if result.sensor_ambiguous:
-                tooltip = "Similar sensors (same response):\n"
-                for c in result.sensor_candidates[:10]:
-                    tooltip += f"  • {c.manufacturer} {c.model}"
-                    if c.variant_params:
-                        tooltip += f" ({c.variant_params})"
-                    tooltip += "\n"
-                if len(result.sensor_candidates) > 10:
-                    remaining = len(result.sensor_candidates) - 10
-                    tooltip += f"  ... and {remaining} more"
-                sensor_item.setToolTip(0, tooltip)
-            chan_item.addChild(sensor_item)
-
-        if result.datalogger:
-            if result.datalogger_confidence >= 0.9:
-                dl_text = (
-                    f"digitizer: {result.datalogger.manufacturer} "
-                    f"{result.datalogger.model}"
-                )
-            elif result.datalogger_ambiguous:
-                n_candidates = len(result.datalogger_candidates)
-                family = (result.datalogger.family_name or
-                          f"{result.datalogger.manufacturer}")
-                dl_text = f"digitizer: {family} (+{n_candidates - 1} similar)"
-            else:
-                dl_text = (
-                    f"digitizer: {result.datalogger.manufacturer} "
-                    f"{result.datalogger.model}"
-                )
-            dl_item = QTreeWidgetItem([dl_text])
-            dl_item.setData(0, Qt.UserRole, ("dl_info", result))
-            dl_item.setForeground(0, QBrush(QColor("#1565c0")))
-            font = dl_item.font(0)
-            font.setItalic(True)
-            dl_item.setFont(0, font)
-            dl_item.setFlags(dl_item.flags() & ~Qt.ItemIsSelectable)
-            is_uncertain = (result.datalogger_ambiguous and
-                            result.datalogger_confidence < 0.9)
-            if is_uncertain:
-                tooltip = f"Confidence: {result.datalogger_confidence:.0%}\n"
-                tooltip += "Similar digitizers (same digital chain):\n"
-                for c in result.datalogger_candidates[:10]:
-                    tooltip += f"  • {c.manufacturer} {c.model}"
-                    if c.variant_params:
-                        tooltip += f" ({c.variant_params})"
-                    tooltip += "\n"
-                if len(result.datalogger_candidates) > 10:
-                    remaining = len(result.datalogger_candidates) - 10
-                    tooltip += f"  ... and {remaining} more"
-                dl_item.setToolTip(0, tooltip)
-            chan_item.addChild(dl_item)
+    def _add_instrumentation(self, chan_item, channel):
+        # Stated instruments need no response, so a channel without one
+        # still gets its rows.
+        for row in instrument_rows(
+            self.main_window.nrl_index, channel.response, channel
+        ):
+            chan_item.addChild(row)
 
     def _add_validation_warnings(self, chan_item, channel):
         """Attach a warning node with one row per metadata issue for this
@@ -718,7 +718,7 @@ class ManagerTab(QWidget):
         chan_item = QTreeWidgetItem([f"Channel: {chan.code}"])
         chan_item.setData(0, Qt.UserRole, ("channel", chan))
         sta_item.addChild(chan_item)
-        self._add_instrument_detection(chan_item, chan)
+        self._add_instrumentation(chan_item, chan)
         # Same validation adornment as the load path: without it new and
         # pasted nodes render clean, disagree with the status-bar issue
         # count, and sprout warnings only on the next full refresh.
@@ -883,12 +883,27 @@ class ManagerTab(QWidget):
         # Set before every rebuild — loads, refresh, edits, theme and font
         # changes all come through here — so the filter survives them.
         # Same group key as TimelineWidget.group_stations.
-        self.timeline_widget.issue_groups = {
+        groups = {
             (f"{net.code}.{sta.code}", fp)
             for fp, _ni, _si, net, sta in self._flagged_stations()
         } if self._issues_only else None
+        if self._instrument_groups is not None:
+            groups = (self._instrument_groups if groups is None
+                      else groups & self._instrument_groups)
+        self.timeline_widget.issue_groups = groups
         self.timeline_widget.update_timeline(
             self.main_window.loaded_files
+        )
+
+    def update_instruments(self):
+        # Same issues-only filter as the map and timeline: the stations the
+        # filtered tree shows, by identity.
+        issue_stations = {
+            id(sta) for _fp, _ni, _si, _net, sta in self._flagged_stations()
+        } if self._issues_only else None
+        self.instruments_widget.set_data(
+            self.main_window.loaded_files, self.main_window.nrl_index,
+            issue_stations,
         )
 
     def open_from_timeline(
@@ -909,10 +924,12 @@ class ManagerTab(QWidget):
 
     def refresh_theme(self):
         self.timeline_widget.refresh_theme()
+        self.instruments_widget.refresh_theme()
         self.update_timeline()
 
     def refresh(self):
         self._stale = False
+        self._recompute_instrument_filter()
         self.file_tree.clear()
         self.all_stations.clear()
         self.network_colors.clear()
@@ -924,6 +941,7 @@ class ManagerTab(QWidget):
         self._apply_issue_filter()
         self._push_markers()
         self.update_timeline()
+        self.update_instruments()
 
     def mark_stale(self):
         """Another tab edited the inventory this tree renders.
@@ -955,8 +973,10 @@ class ManagerTab(QWidget):
             self.all_stations.extend(
                 self._station_markers_for_file(filepath, inventory)
             )
+        self._recompute_instrument_filter()
         self._push_markers()
         self.update_timeline()
+        self.update_instruments()
         self.main_window.update_status_bar()
 
     def _filepath_for_object(self, obj):

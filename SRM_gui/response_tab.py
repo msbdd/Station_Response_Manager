@@ -39,6 +39,13 @@ from matplotlib.figure import Figure
 import numpy as np
 from obspy import read_inventory
 from SRM_gui.explorer_tab import _identity_index, notify_inventory_changed
+from SRM_gui.instrument_ui import expand_group, instrument_group
+from SRM_core.instrumentation import (
+    apply_pick,
+    classify_pick,
+    nrl_pick_equipment,
+    stated_name,
+)
 from obspy.core.inventory.response import (
     ResponseStage,
     PolesZerosResponseStage,
@@ -95,6 +102,12 @@ def _required_field_reason(ref_object, attr):
     )
 
 
+def _channel_edits(op):
+    """The channel instrument edits a bulk_replace op carries (its
+    optional 5th element), as ``[(obj, attr, old_value)]``."""
+    return op[4] if len(op) > 4 else []
+
+
 def _units_label(stage):
     """Compact 'in → out' unit-chain label for a stage header row."""
     in_u = getattr(stage, "input_units", None) or ""
@@ -130,9 +143,18 @@ class MplCanvas(FigureCanvas):
 
 
 class ResponseTab(QWidget):
-    def __init__(self, response_data, main_window, explorer_tab, nrl_root):
+    def __init__(self, response_data, main_window, explorer_tab, nrl_root,
+                 channel=None):
         super().__init__()
         self.response = response_data
+        # The channel owning the response, for its stated instruments;
+        # without one only detection can name them.
+        self.channel = channel
+        # Channel attribute -> copy of its instrument from before this tab
+        # first changed it (Replace Response recording an NRL pick). The
+        # response has a deepcopy baseline; these need their own, taken
+        # lazily so earlier edits in the Explorer are not undone too.
+        self._equipment_baseline = {}
         self.original_response = deepcopy(response_data)
         self.main_window = main_window
         self.explorer_tab = explorer_tab
@@ -263,11 +285,16 @@ class ResponseTab(QWidget):
         # would silently mutate orphans while the UI shows nothing.
         # Holding them is safe because the lines below *replace* the live
         # list/sensitivity rather than mutating them.
+        channel_edits = [
+            (self.channel, attr, getattr(self.channel, attr, None))
+            for attr in self._equipment_baseline
+        ]
         self._push_undo((
             "bulk_replace",
             self.response,
             list(self.response.response_stages),
             self.response.instrument_sensitivity,
+            channel_edits,
         ))
         self.response.response_stages = deepcopy(
             self.original_response.response_stages
@@ -275,6 +302,7 @@ class ResponseTab(QWidget):
         self.response.instrument_sensitivity = deepcopy(
             self.original_response.instrument_sensitivity
         )
+        self._restore_equipment_baseline()
         self._rebuild_stage_baseline_map(self.response)
         self.load_response_editor(self.response)
         QMessageBox.information(
@@ -284,6 +312,7 @@ class ResponseTab(QWidget):
 
     def commit_baseline(self):
         self.original_response = deepcopy(self.selected_response)
+        self._equipment_baseline = {}
         self.undo_stack.clear()
         self.redo_stack.clear()
         self._rebuild_stage_baseline_map(self.selected_response)
@@ -371,85 +400,12 @@ class ResponseTab(QWidget):
         self.stage_tree.clear()
         self._field_index = {}
         self._pz_index = {}
-        nrl_index = self.main_window.nrl_index
-        detection = nrl_index.detect_instrument(response)
-        if detection.found_any:
-            detect_item = QTreeWidgetItem(
-                self.stage_tree, ["Detected Instrumentation", ""]
-            )
-            detect_item.setForeground(0, QBrush(QColor("#2e7d32")))
-            font = detect_item.font(0)
-            font.setBold(True)
-            detect_item.setFont(0, font)
-            detect_item.setExpanded(True)
-
-            if detection.sensor:
-                if detection.sensor_ambiguous:
-                    n_cand = len(detection.sensor_candidates)
-                    mfr = detection.sensor.manufacturer
-                    model = detection.sensor.model
-                    family = detection.sensor.family_name or f"{mfr} {model}"
-                    sensor_text = f"{family} (+{n_cand - 1} similar)"
-                else:
-                    sensor_text = (
-                        f"{detection.sensor.manufacturer} "
-                        f"{detection.sensor.model}"
-                    )
-                sensor_item = QTreeWidgetItem(
-                    detect_item, ["Sensor", sensor_text]
-                )
-                sensor_item.setForeground(0, QBrush(QColor("#2e7d32")))
-                sensor_item.setForeground(1, QBrush(QColor("#2e7d32")))
-                if detection.sensor_ambiguous:
-                    tooltip = "Similar sensors (same response):\n"
-                    for c in detection.sensor_candidates[:10]:
-                        tooltip += f"  • {c.manufacturer} {c.model}"
-                        if c.variant_params:
-                            tooltip += f" ({c.variant_params})"
-                        tooltip += "\n"
-                    if len(detection.sensor_candidates) > 10:
-                        remaining = len(detection.sensor_candidates) - 10
-                        tooltip += f"  ... and {remaining} more"
-                    sensor_item.setToolTip(0, tooltip)
-                    sensor_item.setToolTip(1, tooltip)
-
-            if detection.datalogger:
-                if detection.datalogger_confidence >= 0.9:
-                    dl_text = (
-                        f"{detection.datalogger.manufacturer} "
-                        f"{detection.datalogger.model}"
-                    )
-                elif detection.datalogger_ambiguous:
-                    n_cand = len(detection.datalogger_candidates)
-                    mfr = detection.datalogger.manufacturer
-                    family = detection.datalogger.family_name or mfr
-                    dl_text = f"{family} (+{n_cand - 1} similar)"
-                else:
-                    dl_text = (
-                        f"{detection.datalogger.manufacturer} "
-                        f"{detection.datalogger.model}"
-                    )
-                dl_item = QTreeWidgetItem(
-                    detect_item, ["Digitizer", dl_text]
-                )
-                dl_item.setForeground(0, QBrush(QColor("#1565c0")))
-                dl_item.setForeground(1, QBrush(QColor("#1565c0")))
-                is_uncertain = (detection.datalogger_ambiguous and
-                                detection.datalogger_confidence < 0.9)
-                if is_uncertain:
-                    conf = detection.datalogger_confidence
-                    tooltip = f"Confidence: {conf:.0%}\n"
-                    tooltip += "Similar digitizers (same digital chain):\n"
-                    for c in detection.datalogger_candidates[:10]:
-                        tooltip += f"  • {c.manufacturer} {c.model}"
-                        if c.variant_params:
-                            tooltip += f" ({c.variant_params})"
-                        tooltip += "\n"
-                    if len(detection.datalogger_candidates) > 10:
-                        remaining = len(detection.datalogger_candidates) - 10
-                        tooltip += f"  ... and {remaining} more"
-                    dl_item.setToolTip(0, tooltip)
-                    dl_item.setToolTip(1, tooltip)
+        group = instrument_group(
+            self.main_window.nrl_index, response, self.channel
+        )
+        if group is not None:
+            self.stage_tree.addTopLevelItem(group)
+            expand_group(group)
 
         baseline_sens = (
             self.original_response.instrument_sensitivity
@@ -796,13 +752,19 @@ class ResponseTab(QWidget):
             and hasattr(self, "selected_response")
             and self.selected_response
         ):
+            channel_edits, recorded = self._record_instrument_picks(
+                dlg.get_equipment()
+            )
             # Live objects, not copies — see the comment in
             # revert_response: older undo ops reference exactly these.
+            # The instrument edits ride along, so one undo takes back the
+            # whole replacement.
             self._push_undo((
                 "bulk_replace",
                 self.selected_response,
                 list(self.selected_response.response_stages),
                 self.selected_response.instrument_sensitivity,
+                channel_edits,
             ))
             self.selected_response.response_stages = copy.deepcopy(
                 new_resp.response_stages
@@ -817,8 +779,83 @@ class ResponseTab(QWidget):
             self.load_response_editor(self.selected_response)
             self.plot_response(self.selected_response)
             QMessageBox.information(
-                self, "Success", "Response updated."
+                self, "Success", self._replace_message(recorded)
             )
+
+    # (Channel attribute, label) of the instruments an NRL pick names.
+    _PICK_ROLES = (("sensor", "Sensor"), ("data_logger", "Digitizer"))
+
+    def _record_instrument_picks(self, picks):
+        """Record a replacement's NRL picks as the channel's stated
+        instruments: silently where it names none, and only after asking
+        where it names a different one — a stated instrument is never
+        overwritten unasked.
+
+        Returns the reversible ``[(obj, attr, old)]`` edits and the
+        Channel attributes recorded."""
+        if self.channel is None:
+            return [], []
+        fills, replaces = [], []
+        for (attr, label), picked in zip(self._PICK_ROLES, picks):
+            kind = classify_pick(self.channel, attr, picked)
+            if kind == "fill":
+                fills.append((attr, label, picked))
+            elif kind == "replace":
+                replaces.append((attr, label, picked))
+        if replaces and not self._confirm_replace_instruments(replaces):
+            replaces = []
+        edits, recorded = [], []
+        for attr, label, picked in fills + replaces:
+            if attr not in self._equipment_baseline:
+                self._equipment_baseline[attr] = deepcopy(
+                    getattr(self.channel, attr, None)
+                )
+            edits += apply_pick(self.channel, attr, picked)
+            recorded.append(attr)
+        return edits, recorded
+
+    def _confirm_replace_instruments(self, replaces):
+        changes = "\n".join(
+            f"  {label}: {stated_name(getattr(self.channel, attr))} → "
+            f"{stated_name(picked)}"
+            for attr, label, picked in replaces
+        )
+        reply = QMessageBox.question(
+            self, "Update Stated Instruments?",
+            "The StationXML states a different instrument for this channel "
+            f"than the one picked in the NRL:\n\n{changes}\n\n"
+            "Update it to the NRL pick? Manufacturer, Model and Description "
+            "are taken from the NRL; Type, Vendor and resourceId, which "
+            "describe the old model, are cleared. The serial number and "
+            "dates are kept: edit them in the Explorer if the physical unit "
+            "changed.\n\n"
+            "No keeps the stated instrument as it is.",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No,
+        )
+        return reply == QMessageBox.Yes
+
+    def _replace_message(self, recorded):
+        msg = "Response updated."
+        stated = [
+            (attr, f"  {label}: {name}")
+            for attr, label in self._PICK_ROLES
+            for name in [stated_name(getattr(self.channel, attr, None))]
+            if name
+        ]
+        done = [line for attr, line in stated if attr in recorded]
+        kept = [line for attr, line in stated if attr not in recorded]
+        if done:
+            msg += "\n\nRecorded from the NRL selection:\n" + "\n".join(
+                done)
+        if kept:
+            msg += ("\n\nStated instruments left unchanged (edit them in "
+                    "the Explorer if the instrument changed):\n"
+                    + "\n".join(kept))
+        return msg
+
+    def _restore_equipment_baseline(self):
+        for attr, value in self._equipment_baseline.items():
+            setattr(self.channel, attr, deepcopy(value))
 
     def recalculate_sensitivity(self):
         """Recompute the overall instrument sensitivity from the stage
@@ -1398,10 +1435,12 @@ class ResponseTab(QWidget):
             idx = self._stage_index(stages, stage)
             return idx if idx is not None else len(stages)
         if tag == "bulk_replace":
-            _, response, _stages, _sens = op
+            response = op[1]
             return (
                 response.response_stages,
                 response.instrument_sensitivity,
+                [getattr(obj, attr, None)
+                 for obj, attr, _old in _channel_edits(op)],
             )
         return None
 
@@ -1461,9 +1500,12 @@ class ResponseTab(QWidget):
             setattr(ref_object, attr, None)
             return ("structural",)
         if tag == "bulk_replace":
-            _, response, _stages, _sens = op
+            response = op[1]
             response.response_stages = captured[0]
             response.instrument_sensitivity = captured[1]
+            for (obj, attr, _old), value in zip(_channel_edits(op),
+                                                captured[2]):
+                setattr(obj, attr, value)
             self._rebuild_stage_baseline_map(response)
             return ("structural",)
         return ("structural",)
@@ -1521,9 +1563,11 @@ class ResponseTab(QWidget):
             setattr(ref_object, attr, old_value)
             return ("field", ref_object, attr, old_value)
         if tag == "bulk_replace":
-            _, response, stages_snapshot, sens_snapshot = op
+            _, response, stages_snapshot, sens_snapshot = op[:4]
             response.response_stages = stages_snapshot
             response.instrument_sensitivity = sens_snapshot
+            for obj, attr, old_value in reversed(_channel_edits(op)):
+                setattr(obj, attr, old_value)
             self._rebuild_stage_baseline_map(response)
             return ("structural",)
         return ("structural",)
@@ -1601,6 +1645,11 @@ class ResponseTab(QWidget):
         self.response.instrument_sensitivity = deepcopy(
             self.original_response.instrument_sensitivity
         )
+        # Instrument edits must go too: close_tab drops the file's dirty
+        # mark after a discard, so a kept one would sit in memory unsaved
+        # and ride along unseen with the next save of the file.
+        self._restore_equipment_baseline()
+        self._equipment_baseline = {}
         self._rebuild_stage_baseline_map(self.response)
         self.undo_stack.clear()
         self.redo_stack.clear()
@@ -1651,6 +1700,11 @@ class ResponseSelectionDialog(QDialog):
         self.digitizer_response = None
         self.sensor_info = "Not selected"
         self.digitizer_info = "Not selected"
+        # The instruments picked in the NRL, to record as the channels'
+        # <Sensor>/<DataLogger>; None for a response loaded from a file,
+        # which names no instrument.
+        self.sensor_pick = None
+        self.digitizer_pick = None
         self.final_resp = None
 
         self._init_ui()
@@ -1708,6 +1762,9 @@ class ResponseSelectionDialog(QDialog):
                 try:
                     self.sensor_response = self.nrl.get_sensor_response(keys)
                     self.sensor_info = f"From NRL: {desc}"
+                    self.sensor_pick = nrl_pick_equipment(
+                        keys, wizard.final_nrl_description
+                    )
                 except Exception as e:
                     QMessageBox.critical(
                         self,
@@ -1715,6 +1772,7 @@ class ResponseSelectionDialog(QDialog):
                         f"Failed to get sensor response:\n{e}",
                     )
                     self.sensor_response = None
+                    self.sensor_pick = None
             self._update_ui()
 
     def launch_digitizer_wizard(self):
@@ -1727,6 +1785,9 @@ class ResponseSelectionDialog(QDialog):
                         keys
                     )
                     self.digitizer_info = f"From NRL: {desc}"
+                    self.digitizer_pick = nrl_pick_equipment(
+                        keys, wizard.final_nrl_description
+                    )
                 except Exception as e:
                     QMessageBox.critical(
                         self,
@@ -1734,6 +1795,7 @@ class ResponseSelectionDialog(QDialog):
                         f"Failed to get datalogger response:\n{e}",
                     )
                     self.digitizer_response = None
+                    self.digitizer_pick = None
             self._update_ui()
 
     def select_sensor_from_file(self):
@@ -1744,6 +1806,7 @@ class ResponseSelectionDialog(QDialog):
             "StationXML (*.xml);;RESP (*.resp);;All Files (*)",
         )
         if path:
+            self.sensor_pick = None
             try:
                 inv = read_inventory(path)
                 self.sensor_response = inv[0][0][0].response
@@ -1763,6 +1826,7 @@ class ResponseSelectionDialog(QDialog):
             "StationXML (*.xml);;RESP (*.resp);;All Files (*)",
         )
         if path:
+            self.digitizer_pick = None
             try:
                 inv = read_inventory(path)
                 self.digitizer_response = inv[0][0][0].response
@@ -1818,6 +1882,11 @@ class ResponseSelectionDialog(QDialog):
     def get_response(self):
         return self.final_resp, self.sensor_info, self.digitizer_info
 
+    def get_equipment(self):
+        """``(sensor, datalogger)`` Equipment picked in the NRL, each None
+        when that half came from a file."""
+        return self.sensor_pick, self.digitizer_pick
+
 
 class NRLWizard(QDialog):
 
@@ -1838,6 +1907,10 @@ class NRLWizard(QDialog):
         self.selected_option = None
         self._final_xml_config = None
         self.final_description = ""
+        # The chosen leaf's description as the NRL states it ("Streckeisen;
+        # STS-2.5; Long-Period_Corner 120 s; …"), unwrapped and unprefixed.
+        self.final_nrl_description = ""
+        self._option_descriptions = {}
 
         self.auto_step_timer = QTimer(self)
         self.auto_step_timer.setSingleShot(True)
@@ -1949,6 +2022,7 @@ class NRLWizard(QDialog):
         self.question_label.setText(question)
 
         self.option_buttons = {}
+        self._option_descriptions = {}
         for section in sorted(
             [s for s in config.sections() if s != "Main"], key=natural_sort_key
                 ):
@@ -1966,6 +2040,7 @@ class NRLWizard(QDialog):
             )
             self.scroll_layout.addWidget(btn)
             self.option_buttons[section] = (btn, xml)
+            self._option_descriptions[section] = desc
 
     def next_step(self):
 
@@ -1981,6 +2056,9 @@ class NRLWizard(QDialog):
             self.final_description = self.option_buttons[self.selected_option][
                 0
             ].text()
+            self.final_nrl_description = self._option_descriptions.get(
+                self.selected_option, ""
+            )
             self.accept()
             return
 

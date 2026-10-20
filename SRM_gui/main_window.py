@@ -561,13 +561,15 @@ class MainWindow(QMainWindow):
         self.tabs.setCurrentIndex(index)
         return explorer
 
-    def open_response_tab(self, response_id, response_data, explorer_tab):
+    def open_response_tab(self, response_id, response_data, explorer_tab,
+                          channel=None):
         # Key on the Response object's identity, not its display id, so two
         # channels/epochs that render to the same id still get separate tabs.
         key = ("response", id(response_data))
         if key not in self.open_tabs:
             response_tab = ResponseTab(
-                response_data, self, explorer_tab, self.nrl_root
+                response_data, self, explorer_tab, self.nrl_root,
+                channel=channel,
             )
             index = self.tabs.addTab(response_tab, f"Response - {response_id}")
             self.open_tabs[key] = response_tab
