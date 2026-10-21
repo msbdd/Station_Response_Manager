@@ -97,35 +97,7 @@ class MainWindow(QMainWindow):
         self.open_tabs = {}
         self.dirty_paths = set()
 
-        self.nrl_root = resource_path(os.path.join("resources", "NRL"))
-        while True:
-            try:
-                self.nrl = NRL(root=self.nrl_root)
-                break
-            except Exception:
-                reply = QMessageBox.question(
-                    self,
-                    "NRL Not Found",
-                    "NRL folder not detected at:\n"
-                    f"{self.nrl_root}\n\nWould you like to select the NRL"
-                    f"folder manually?",
-                    QMessageBox.Yes | QMessageBox.No,
-                    QMessageBox.Yes,
-                )
-                if reply == QMessageBox.Yes:
-                    folder = QFileDialog.getExistingDirectory(
-                        self, "Select NRL Folder", os.path.expanduser("~")
-                    )
-                    if folder:
-                        self.nrl_root = folder
-                        continue
-                QMessageBox.critical(
-                    self,
-                    "NRL Required",
-                    "NRL folder is required to run this application."
-                    "\nExiting.",
-                )
-                sys.exit(1)
+        self.nrl_root, self.nrl = self._open_nrl()
 
         self.nrl_index = NRLIndex(self.nrl_root)
         if self.nrl_index.needs_rebuild():
@@ -143,6 +115,51 @@ class MainWindow(QMainWindow):
         self._status_label.linkActivated.connect(self._show_issue_stations)
         self.statusBar().addPermanentWidget(self._status_label, 1)
         self.update_status_bar()
+
+    def _open_nrl(self):
+        """The NRL to work with, as ``(root, NRL)``.
+
+        The bundled folder comes first, then the one picked by hand on an
+        earlier run. The user is asked only when neither opens, and a pick
+        that opens is remembered, so the question does not come back."""
+        tried = []
+        for root in (resource_path(os.path.join("resources", "NRL")),
+                     view_settings.saved_nrl_root()):
+            if root is None:
+                continue
+            try:
+                return root, NRL(root=root)
+            except Exception:
+                tried.append(root)
+        while True:
+            reply = QMessageBox.question(
+                self,
+                "NRL Not Found",
+                "NRL folder not detected at:\n"
+                + "\n".join(tried)
+                + "\n\nWould you like to select the NRL folder manually?",
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.Yes,
+            )
+            if reply == QMessageBox.Yes:
+                folder = QFileDialog.getExistingDirectory(
+                    self, "Select NRL Folder", os.path.expanduser("~")
+                )
+                if folder:
+                    try:
+                        nrl = NRL(root=folder)
+                    except Exception:
+                        tried = [folder]
+                        continue
+                    view_settings.save_nrl_root(folder)
+                    return folder, nrl
+            QMessageBox.critical(
+                self,
+                "NRL Required",
+                "NRL folder is required to run this application."
+                "\nExiting.",
+            )
+            sys.exit(1)
 
     def setup_menu(self):
         menubar = self.menuBar()

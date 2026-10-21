@@ -1,4 +1,5 @@
-"""View settings kept between sessions: the theme and the font size.
+"""Settings kept between sessions: the theme, the font size, and the NRL
+folder when it had to be picked by hand.
 
 Stored with QSettings in INI format, so on every platform they are one
 small text file in the user's config directory:
@@ -7,9 +8,12 @@ small text file in the user's config directory:
                    ($XDG_CONFIG_HOME is honoured)
     Windows:       %APPDATA%\\SRM\\StationResponseManager.ini
 
-Deleting the file brings back the defaults: the desktop's palette and the
-system font size.
+Deleting the file brings back the defaults: the desktop's palette, the
+system font size, and the question for the NRL folder when the bundled
+one is missing.
 """
+import os
+
 from PyQt5.QtCore import QSettings
 from PyQt5.QtGui import QColor, QFontDatabase, QPalette
 from PyQt5.QtWidgets import QApplication
@@ -122,3 +126,18 @@ def restore():
     size = saved_font_size()
     if size is not None:
         set_font_size(size)
+
+
+def saved_nrl_root():
+    """The NRL folder picked by hand on an earlier run, or None when none
+    (or no absolute path) is saved. The folder itself may be gone since."""
+    root = _store().value("nrl_root")
+    # Anything else must never reach ObsPy's NRL(): it takes an empty root
+    # or an http(s) URL as a request for its retired online NRL.
+    return root if isinstance(root, str) and os.path.isabs(root) else None
+
+
+def save_nrl_root(path):
+    store = _store()
+    store.setValue("nrl_root", path)
+    store.sync()
