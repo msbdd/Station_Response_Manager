@@ -763,7 +763,7 @@ class ManagerTab(QWidget):
                 # with a fresh object, orphaning any explorer tab
                 # already editing the original.
                 inventory = Inventory(
-                    networks=[], source="Seismic Response Manager"
+                    networks=[], source="Station Response Manager"
                 )
                 self.main_window.loaded_files[filepath] = inventory
 

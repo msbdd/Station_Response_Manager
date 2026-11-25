@@ -756,7 +756,7 @@ class MainWindow(QMainWindow):
             )
             return
         try:
-            inv = Inventory(networks=[], source="Seismic Response Manager")
+            inv = Inventory(networks=[], source="Station Response Manager")
             # Write first: registering a file whose write failed would
             # leave a phantom loaded_files entry with no tree node.
             atomic_write_inventory(inv, filepath, fmt="STATIONXML")
