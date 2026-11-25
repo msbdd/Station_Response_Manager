@@ -1,4 +1,4 @@
-# Seismic Response Manager
+# Station Response Manager
 
 ![License: GPL v3](https://img.shields.io/badge/License-GPLv3-brightgreen.svg)
 ![Code style: flake8](https://img.shields.io/badge/Code%20style-flake8-brightgreen)
@@ -6,7 +6,7 @@
 [![Build Windows](https://github.com/msbdd/Station_Response_Manager/actions/workflows/Distribute_Windows.yml/badge.svg)](https://github.com/msbdd/Station_Response_Manager/actions/workflows/Distribute_Windows.yml)
 [![Build Linux AppImage](https://github.com/msbdd/Station_Response_Manager/actions/workflows/Distribute_Linux_AppImage.yml/badge.svg)](https://github.com/msbdd/Station_Response_Manager/actions/workflows/Distribute_Linux_AppImage.yml)
 
-**Seismic Response Manager** is a user-friendly tool for viewing, editing, and managing seismic station metadata in both [FDSN StationXML](https://www.fdsn.org/xml/station/) and [dataless SEED](https://ds.iris.edu/ds/nodes/dmc/data/formats/dataless-seed/) formats.
+**Station Response Manager** is a user-friendly tool for viewing, editing, and managing seismic station metadata in both [FDSN StationXML](https://www.fdsn.org/xml/station/) and [dataless SEED](https://ds.iris.edu/ds/nodes/dmc/data/formats/dataless-seed/) formats.
 
 ## Motivation
 
@@ -17,7 +17,7 @@ While the Java version of PDCC still works, I experienced issues:
 - No StationXML support
 - No openly available repo with issue list, etc
 
-StationXML is a great format for managing station metadata — but editing it manually in a text editor isn't always comfortable. **Seismic Response Manager** is designed for usability, making common tasks easier, safer, and more convenient.
+StationXML is a great format for managing station metadata — but editing it manually in a text editor isn't always comfortable. **Station Response Manager** is designed for usability, making common tasks easier, safer, and more convenient.
 
 ## Documentation
 
